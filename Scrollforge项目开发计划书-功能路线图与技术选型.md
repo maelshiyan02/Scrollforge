@@ -37,22 +37,26 @@ Scrollforge 是一款面向深度阅读者的电子书阅读器。名字来自 *
 | 层 | 选择 | 理由 |
 |----|------|------|
 | **桌面壳** | Tauri v2 | 安装包 ~10MB，内存 ~50MB，Rust 安全，比 Electron 轻 15 倍 |
-| **前端** | React 19 + Vite | 活生态，组件多，比 Next.js 轻 |
+| **前端** | Next.js 16 + React 19 + TypeScript（沿用骨架） | 骨架 readest 就是这套；如果要自建则退化为 React + Vite |
 | **后端** | Rust | 格式解析性能；SQLite (rusqlite)；搜索 (tantivy) |
-| **格式解析** | Rust 自写 EPUB/MOBI + Python 备用 | Readest 已有先例 |
-| **EPUB 渲染** | Readium.js | Web Components，EPUB 3 标准实现 |
+| **格式解析** | 骨架自带（Readest 已支持 EPUB/MOBI/KF8/FB2/CBZ/TXT/PDF） | 不重写解析器 |
+| **EPUB 渲染** | foliate-js（Readest 的渲染内核即源于此） | 纯 JS、模块化、MIT；**不是 Readium.js** |
 | **数据库** | SQLite (rusqlite) | 本地优先，零配置 |
 | **AI 后端** | Rust + HTTP API | 可切换本地模型 / 云端 API |
 
-### 可参考的开源骨架
+### 可参考的开源骨架（已核验 star 与许可证）
 
-| 项目 | 参考什么 | GitHub |
-|------|----------|--------|
-| **ReadAware** | Tauri + React + Rust + SQLite 整体架构 | `ahpxex/read-aware` |
-| **Readest** | Rust 格式解析 (epub_parser / mobi_parser) | `readest/readest` |
-| **Calibre** | 脚注气泡 CSS 交互模式 | Python + Qt，**不要重写** |
-| **月读 yuedu** | TXT 章节识别、连续滚动、段落级进度记忆 | `vsh5dvsch7-png/yuedu` |
-| **Koodo Reader** | React 前端架构成熟实践 | `koodo-reader/koodo-reader` |
+| 项目 | star | 许可证 | 参考什么 | GitHub |
+|------|------|--------|----------|--------|
+| **Readest** | 25.7k | AGPL-3.0 | **主骨架**：Tauri v2 + Next.js 16 + TS 整套工程，直接 fork 改造 | `readest/readest` |
+| **ReadAware** | 479 | AGPL-3.0 | 功能架构蓝本：自进化 Agent 的跨书记忆 + 沙箱插件系统 | `ahpxex/read-aware` |
+| **foliate-js** | 1.1k | **MIT** | 渲染内核备选（自建路线），可直接引入 | `johnfactotum/foliate-js` |
+| **Calibre** | 26.3k | GPL-3.0 | 脚注气泡交互模式（只读，Python + Qt，**不要重写**） | `kovidgoyal/calibre` |
+| **月读 yuedu** | 34 | NOASSERTION | TXT 章节识别、连续滚动、段落级进度记忆、老板键 | `vsh5dvsch7-png/yuedu` |
+| **Koodo Reader** | 28.6k | AGPL-3.0 | React 前端架构成熟实践；本机已装可对照交互 | `koodo-reader/koodo-reader` |
+| **Readium CSS** | 127 | BSD-3-Clause | 排版样式表，可直接引入 | `readium/css` |
+
+> 许可证红线：可复制代码的只有 foliate-js(MIT)、readium/css(BSD-3)、thorium-reader(BSD-3)；Readest / ReadAware / Koodo / Calibre 均为 AGPL 或 GPL，只能读设计、不能抄代码。fork Readest 意味着 Scrollforge 整体按 AGPL-3.0 开源。
 
 ---
 
