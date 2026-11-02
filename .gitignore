@@ -30,3 +30,38 @@ data/
 books/
 cache/
 *.log
+
+# Reference apps & source (local only, never committed)
+_reference_apps/
+_reference_src/
+_testdata/
+
+# Tauri generated
+app/src-tauri/gen/
+app/src-tauri/target/
+app/dist/
+
+# 锻造层历史快照（阶段 3 起产生）
+.history/
+
+# 内置运行时与校验器（体积大，按需从 _tools 重新拷入，不进 git）
+app/src-tauri/resources/runtime/
+app/src-tauri/resources/epubcheck/
+
+# 用户产物：书库副本 / 导出文件 / 阅读历史（含版权内容，绝不入库）
+local book repository/
+final export/
+reading history/
+
+# .agent 调试产物兜底（截图 / 日志 / 一次性脚本 / 二进制工具）
+.agent/*.png
+.agent/*.log
+.agent/*.txt
+.agent/*.js
+.agent/*.mjs
+.agent/*.exe
+.agent/*.cs
+.agent/shots/
+.agent/tmp/
+.agent/tmp-e5/
+.agent/tmp_e3/
