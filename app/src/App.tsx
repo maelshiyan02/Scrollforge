@@ -12,14 +12,25 @@ import HelpDialog from './components/HelpDialog'
 import ImportDialog, { type ImportRequest } from './components/ImportDialog'
 import CheckDialog from './components/CheckDialog'
 import { clearProgress } from './lib/progress'
-import { extractCover, forgetCover } from './lib/cover'
+import { extractCover, forgetCover, clearCoverCache } from './lib/cover'
 import { loadTypography, saveTypography } from './lib/typography'
 import { loadPrefs, savePrefs, type Prefs } from './lib/prefs'
+import { applyTheme } from './lib/theme'
 import { ALL_FORMATS, IMPORT_FILTERS, formatLabel } from './lib/formats'
 import type { AppSettings, BookMeta, ReaderSource, Typography } from './types'
 import './styles.css'
 
 const FALLBACK_FORMATS = ALL_FORMATS
+
+type ShelfHealthReport = {
+  scanned: number
+  coversRepaired: number
+  coversRemoved: number
+  repairedTitles: string[]
+  removedFiles: string[]
+  missingSources: string[]
+  uncoveredTitles: string[]
+}
 
 function baseName(path: string): string {
   return path.split(/[\\/]/).pop() ?? '未命名'
@@ -73,7 +84,27 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  // 启动与「刷新书架」共用：先自检（修复封面、清理冗余、检查正文），再列书架
   const refreshLibrary = useCallback(async () => {
+    try {
+      const report = await invoke<ShelfHealthReport>('shelf_health')
+      const changed =
+        report.coversRepaired > 0 ||
+        report.coversRemoved > 0 ||
+        report.missingSources.length > 0 ||
+        report.uncoveredTitles.length > 0
+      if (changed) {
+        clearCoverCache()
+        const parts: string[] = []
+        if (report.coversRepaired > 0) parts.push(`修复封面 ${report.coversRepaired} 本`)
+        if (report.coversRemoved > 0) parts.push(`清理冗余封面 ${report.coversRemoved} 个`)
+        if (report.missingSources.length > 0) parts.push(`正文缺失 ${report.missingSources.length} 本`)
+        if (report.uncoveredTitles.length > 0) parts.push(`无封面 ${report.uncoveredTitles.length} 本`)
+        notify(`书架自检：${parts.join('，')}`)
+      }
+    } catch (err) {
+      console.warn('书架自检失败', err)
+    }
     try {
       const books = await invoke<BookMeta[]>('list_books')
       setLibrary(Array.isArray(books) ? books : [])
@@ -81,7 +112,7 @@ export default function App() {
       console.warn('读取书架失败', err)
       setLibrary([])
     }
-  }, [])
+  }, [notify])
 
   const loadSettings = useCallback(async () => {
     try {
@@ -109,6 +140,11 @@ export default function App() {
       return next
     })
   }, [])
+
+  // 三档主题挂到根元素，所有界面（含弹窗/浮层）同步换色
+  useEffect(() => {
+    applyTheme(prefs.theme)
+  }, [prefs.theme])
 
   const allowedFormats = settings?.importFormats?.length ? settings.importFormats : FALLBACK_FORMATS
 
@@ -331,6 +367,7 @@ export default function App() {
           typography={typography}
           onTypography={updateTypography}
           prefs={prefs}
+          onPrefs={updatePrefs}
           onHelp={() => setHelpOpen(true)}
           onBack={() => { setRoute('shelf'); void refreshLibrary() }}
           onOpenEpub={chooseOpenFile}

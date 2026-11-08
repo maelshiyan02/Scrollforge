@@ -759,6 +759,11 @@ export class Paginator extends HTMLElement {
         }))
         this.#scrollToAnchor(this.#anchor)
     }
+    // Scrollforge patch: 主题切换后只同步页面四周的铺底色，不触发重排
+    refreshBackground() {
+        if (!this.#view) return
+        this.#background.style.background = getBackground(this.#view.document)
+    }
     get scrolled() {
         return this.getAttribute('flow') === 'scrolled'
     }

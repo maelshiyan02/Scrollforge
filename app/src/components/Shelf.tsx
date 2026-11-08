@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AppSettings, BookMeta } from '../types'
-import type { Prefs } from '../lib/prefs'
+import { nextTheme, themeLabel, type Prefs } from '../lib/prefs'
 import { lastReadAt, progressPercent } from '../lib/progress'
 import { coverUrl } from '../lib/cover'
 import Icon from './Icon'
@@ -432,6 +432,14 @@ export default function Shelf({
             <Icon name="shelves" />
           </button>
           <span className="sep" />
+          <button
+            className="btn icon-only"
+            data-tip={`界面主题：${themeLabel(prefs.theme)}（点击切换日间 / 护眼 / 夜间）`}
+            aria-label="切换界面主题"
+            onClick={() => onPrefs({ theme: nextTheme(prefs.theme) })}
+          >
+            <Icon name={prefs.theme === 'night' ? 'brightness_3' : prefs.theme === 'eye' ? 'visibility' : 'wb_sunny'} />
+          </button>
           <button
             className="btn icon-only"
             data-tip="刷新书架（重新扫描本地书库与阅读历史）"

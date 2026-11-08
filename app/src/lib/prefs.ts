@@ -8,8 +8,12 @@ export type TranslateMode = 'auto' | 'local' | 'online'
 export type TranslateStyle = 'literary' | 'faithful' | 'casual'
 export type TranslateSource = 'auto' | 'zh' | 'en' | 'ja' | 'ko' | 'fr' | 'de' | 'ru' | 'es'
 export type TranslateTarget = 'zh' | 'en' | 'ja' | 'ko' | 'fr' | 'de' | 'ru' | 'es'
+/** 界面三档视觉：日间纸白 / 护眼绿纸面 / 夜间深灰 */
+export type ThemeMode = 'day' | 'eye' | 'night'
 
 export type Prefs = {
+  /** 界面主题：day 日间 / eye 护眼 / night 夜间 */
+  theme: ThemeMode
   /** 打开图书时默认翻页方式 */
   readerFlow: ReaderFlow
   /** 打开图书时默认双页 */
@@ -59,6 +63,7 @@ export type Prefs = {
 }
 
 export const DEFAULT_PREFS: Prefs = {
+  theme: 'day',
   readerFlow: 'paginated',
   readerDoublePage: false,
   readerVertical: false,
@@ -87,6 +92,8 @@ export const DEFAULT_PREFS: Prefs = {
 const KEY = 'scrollforge:prefs'
 const LEGACY_SHELF = 'scrollforge:shelf'
 
+const THEMES: ThemeMode[] = ['day', 'eye', 'night']
+const THEME_LABEL: Record<ThemeMode, string> = { day: '日间', eye: '护眼', night: '夜间' }
 const SHELF_VIEWS: ShelfView[] = ['grid', 'list', 'shelf3d']
 const SHELF_SORTS: ShelfSort[] = ['recent', 'imported', 'title']
 const READER_FLOWS: ReaderFlow[] = ['paginated', 'scrolled']
@@ -116,6 +123,7 @@ export function loadPrefs(): Prefs {
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<Prefs>
       return {
+        theme: pick(parsed.theme, THEMES, DEFAULT_PREFS.theme),
         readerFlow: pick(parsed.readerFlow, READER_FLOWS, DEFAULT_PREFS.readerFlow),
         readerDoublePage: Boolean(parsed.readerDoublePage),
         readerVertical: Boolean(parsed.readerVertical),
@@ -164,4 +172,14 @@ export function savePrefs(value: Prefs): void {
   } catch {
     // 忽略
   }
+}
+
+/** 顶栏按钮用：日间 → 护眼 → 夜间 → 日间 */
+export function nextTheme(mode: ThemeMode): ThemeMode {
+  const index = THEMES.indexOf(mode)
+  return THEMES[(index + 1) % THEMES.length]
+}
+
+export function themeLabel(mode: ThemeMode): string {
+  return THEME_LABEL[mode]
 }

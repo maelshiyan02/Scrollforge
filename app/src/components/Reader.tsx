@@ -13,6 +13,8 @@ import { analyzeTxt, type TxtAnalysis } from '../lib/txt-chapters'
 import { buildTxtBook } from '../lib/txt-book'
 import { buildEpub, bytesToBase64 } from '../lib/epub-writer'
 import type { Prefs } from '../lib/prefs'
+import { nextTheme, themeLabel } from '../lib/prefs'
+import { applyReaderTheme, applyTheme } from '../lib/theme'
 import { readPageImages, releaseImages, type PageImage } from '../lib/gallery'
 import { applyTypography, clampFontSize, DEFAULT_TYPOGRAPHY } from '../lib/typography'
 import { clearProgress, progressKeyOf, readProgress, writeProgress } from '../lib/progress'
@@ -65,6 +67,8 @@ type Props = {
   exportDir?: string | null
   /** 阅读/编辑偏好（默认翻页方式、竖排、编辑器字号等） */
   prefs: Prefs
+  /** 修改偏好（顶栏主题按钮用） */
+  onPrefs: (patch: Partial<Prefs>) => void
   /** F1 说明书（iframe 内按键不会冒泡到窗口，需要在这里转发） */
   onHelp?: () => void
   /** 非空且匹配 source.meta.id 时，自动打开编辑面板（一次性消费） */
@@ -175,6 +179,7 @@ export default function Reader({
   libraryDir,
   exportDir,
   prefs,
+  onPrefs,
   onHelp,
   autoEditBookId,
   onAutoEditConsumed,
@@ -186,6 +191,7 @@ export default function Reader({
   const keyRef = useRef(progressKeyOf(source))
   const verticalRef = useRef(prefs.readerVertical)
   const typographyRef = useRef(typography)
+  const themeRef = useRef(prefs.theme)
   const flowRef = useRef<'paginated' | 'scrolled'>(prefs.readerFlow)
   const doubleRef = useRef(prefs.readerDoublePage)
   const prefsRef = useRef(prefs)
@@ -282,6 +288,7 @@ export default function Reader({
   footnoteRef.current = footnote
 
   typographyRef.current = typography
+  themeRef.current = prefs.theme
 
   const paintDoc = useCallback((doc: any) => {
     if (!doc?.documentElement) return
@@ -297,6 +304,7 @@ export default function Reader({
       'important',
     )
     applyTypography(doc, typographyRef.current)
+    applyReaderTheme(doc, themeRef.current)
   }, [])
 
   /** 固定版式整页缩放：数值 = 「适应整页」的倍数，换算成绝对 scale 交给渲染器 */
@@ -686,6 +694,17 @@ export default function Reader({
     docsRef.current.forEach((doc) => applyTypography(doc, typography))
     viewRef.current?.renderer?.render?.()
   }, [typography])
+
+  // 主题切换：正文底色与文字色跟着外壳走
+  useEffect(() => {
+    themeRef.current = prefs.theme
+    applyTheme(prefs.theme)
+    docsRef.current.forEach((doc) => applyReaderTheme(doc, prefs.theme))
+    // foliate 的分页器自己有一层铺底（页面四周的留白），不会随 iframe 变色；
+    // 调用 vendor 里新增的 refreshBackground 让它按章节文档的实际底色重刷
+    const renderer = viewRef.current?.renderer as { refreshBackground?: () => void } | undefined
+    renderer?.refreshBackground?.()
+  }, [prefs.theme])
 
   const flip = useCallback(
     async (dir: 1 | -1) => {
@@ -1202,8 +1221,8 @@ export default function Reader({
           disabled={!forgeData || source.kind !== 'library'}
           data-tip={
             forgeData && source.kind === 'library'
-              ? '逐段改写、翻译、注释，写回 TXT 源文件（可回滚）'
-              : '锻造只支持从书架打开的 TXT 图书'
+              ? '逐段改写、翻译、注释，写回 EPUB / TXT 源文件（可回滚）'
+              : '锻造只支持从书架打开的 EPUB / TXT 图书'
           }
           aria-label="锻造"
           onClick={() => setForgeOpen((v) => !v)}
@@ -1212,6 +1231,14 @@ export default function Reader({
         </button>
         </>
         )}
+        <button
+          className="btn icon-only"
+          data-tip={`界面主题：${themeLabel(prefs.theme)}（点击切换日间 / 护眼 / 夜间）`}
+          aria-label="切换界面主题"
+          onClick={() => onPrefs({ theme: nextTheme(prefs.theme) })}
+        >
+          <Icon name={prefs.theme === 'night' ? 'brightness_3' : prefs.theme === 'eye' ? 'visibility' : 'wb_sunny'} />
+        </button>
         <span className="grow" />
         <span className="bookname" title={title}>{title || '未打开书籍'}</span>
       </header>

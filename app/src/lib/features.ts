@@ -56,6 +56,36 @@ export const STATUS_LABEL: Record<FeatureStatus, string> = {
 
 export const FEATURES: FeatureEntry[] = [
   {
+    id: 'appearance',
+    icon: 'palette',
+    title: '外观与护眼',
+    status: 'online',
+    where: '设置页「功能」切面；书架与阅读页顶栏最右的调色按钮（日间 → 护眼 → 夜间循环）',
+    desc:
+      '日间是纸白底，保持原有观感；护眼是低饱和绿纸面，整体亮度与蓝光观感都更低；夜间是深灰纸面，不用纯黑以避免暗环境光晕。' +
+      '阅读页正文、锻造台、EPUB 编辑页、弹窗全部跟随；图片与封面三档都不反色，夜间只轻微降亮。',
+    settings: [
+      {
+        kind: 'select',
+        key: 'theme',
+        label: '界面主题',
+        hint: '日间=纸白；护眼=绿纸面；夜间=深灰。顶栏调色按钮可随时轮换，选择会记住。',
+        options: [
+          { value: 'day', label: '日间（纸白）' },
+          { value: 'eye', label: '护眼（绿纸面）' },
+          { value: 'night', label: '夜间（深灰）' },
+        ],
+      },
+      {
+        kind: 'note',
+        label: '覆盖范围与边界',
+        hint:
+          '阅读正文会跟随主题换底色与文字色；EPUB 编辑页随三档切换（日间浅色、夜间深色）。' +
+          'PDF / CBZ 是固定版式，页面内容按原样渲染，只把周围舞台变暗。',
+      },
+    ],
+  },
+  {
     id: 'reading',
     icon: 'auto_stories',
     title: '阅读与彩页',
