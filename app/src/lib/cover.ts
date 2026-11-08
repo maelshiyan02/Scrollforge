@@ -27,6 +27,18 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary)
 }
 
+/** 用魔数判断真实图片类型；后端返回的一定是图片，但旧缓存可能是 xhtml，不能再迷信扩展名。 */
+function sniffMime(bytes: Uint8Array): string | null {
+  if (bytes.length < 12) return null
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png'
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif'
+  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57) {
+    return 'image/webp'
+  }
+  return null
+}
+
 /** 书封的 blob URL；没有封面或读取失败返回 null。 */
 export function coverUrl(book: BookMeta): Promise<string | null> {
   // 扁平模型下 book.cover 可能是 null，但后端 read_cover 会自动 fallback（实时从 epub zip 解封面）
@@ -44,7 +56,7 @@ export function coverUrl(book: BookMeta): Promise<string | null> {
         return null
       }
       // 没有 book.cover 时用默认 image/jpeg（后端 fallback 提取的一般是 jpg）
-      const mime = book.cover ? mimeOf(book.cover) : 'image/jpeg'
+      const mime = sniffMime(bytes) ?? (book.cover ? mimeOf(book.cover) : 'image/jpeg')
       const url = URL.createObjectURL(new Blob([bytes], { type: mime }))
       cache.set(book.id, url)
       return url
@@ -65,6 +77,15 @@ export function forgetCover(id: string): void {
   if (url) URL.revokeObjectURL(url)
   cache.delete(id)
   loading.delete(id)
+}
+
+/** 书架自检/刷新后清空内存缓存，强制重新读盘。 */
+export function clearCoverCache(): void {
+  for (const url of cache.values()) {
+    if (url) URL.revokeObjectURL(url)
+  }
+  cache.clear()
+  loading.clear()
 }
 
 /** 把 EPUB 的封面抽出来写进书库目录，返回是否成功。 */

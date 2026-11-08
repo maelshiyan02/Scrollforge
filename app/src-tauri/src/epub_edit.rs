@@ -237,6 +237,14 @@ pub fn unpack_epub(epub_path: &Path, edit_dir: &Path) -> Result<EditWorkspace, S
         return Err("没找到 META-INF/container.xml".into());
     }
 
+    // OPF 可能排在 container.xml 之前，循环里的顺序匹配会漏；这里从已解压文件补解析一次
+    if manifest_map.is_empty() {
+        let opf_probe = edit_dir.join(&opf_rel);
+        if let Ok(buf) = fs::read(&opf_probe) {
+            manifest_map = parse_opf_manifest(&buf, &opf_dir)?;
+        }
+    }
+
     // 回填 manifest id
     for entry in entries.iter_mut() {
         if let Some((id, _)) = manifest_map.get(&entry.path) {
@@ -375,7 +383,8 @@ fn parse_opf_manifest(buf: &[u8], opf_dir: &str) -> Result<HashMap<String, (Stri
 
     loop {
         match reader.read_event_into(&mut buf_key) {
-            Ok(quick_xml::events::Event::Start(ref e)) => {
+            // 兼顾外部 EPUB 的写法：<item .../> 是 Empty 事件，自家生成的可能是 Start
+            Ok(quick_xml::events::Event::Start(ref e) | quick_xml::events::Event::Empty(ref e)) => {
                 let local = e.local_name();
                 let local_bytes: &[u8] = local.as_ref();
                 if local_bytes == b"manifest" {
@@ -433,7 +442,8 @@ pub fn parse_opf_spine(buf: &[u8]) -> Result<Vec<String>, String> {
 
     loop {
         match reader.read_event_into(&mut buf_key) {
-            Ok(quick_xml::events::Event::Start(ref e)) => {
+            // <itemref .../> 在多数 EPUB 中是自闭合标签（Empty），必须一并处理
+            Ok(quick_xml::events::Event::Start(ref e) | quick_xml::events::Event::Empty(ref e)) => {
                 let local = e.local_name();
                 let lb: &[u8] = local.as_ref();
                 if lb == b"spine" {
@@ -2559,8 +2569,10 @@ fn extract_plain_text(raw_inner: &str) -> String {
             i += close + 1;
             out.push(' ');
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            // 按 UTF-8 字符推进：直接把字节 as char 会把中文变成 latin-1 乱码
+            let ch = raw_inner[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
         }
     }
     // 简单实体还原（常用几种）
@@ -2705,4 +2717,62 @@ pub fn forge_epub_index(
         flat_blocks,
         edit_dir: ws.edit_dir,
     })
+}
+
+#[cfg(test)]
+mod forge_epub_tests {
+    use super::*;
+
+    /// 从本地书库取任一 EPUB 作为样本；换机器没有样本时跳过，不硬失败。
+    fn sample_book() -> Option<PathBuf> {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()?
+            .parent()?
+            .join("local book repository");
+        let mut found: Vec<PathBuf> = fs::read_dir(repo)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("epub"))
+            .collect();
+        found.sort();
+        found.into_iter().next()
+    }
+
+    /// 回归测试：外部 EPUB（manifest/itemref 自闭合）必须能解析出章节与正文块。
+    /// 之前只匹配 Event::Start，导致锻造按钮一直是灰的。
+    #[test]
+    fn forge_index_parses_spine_and_manifest() {
+        let Some(book) = sample_book() else {
+            eprintln!("skip: 书库中没有 EPUB 样本");
+            return;
+        };
+        let edit = std::env::temp_dir().join("scrollforge_forge_test");
+        let _ = fs::remove_dir_all(&edit);
+        let idx = forge_epub_index(&book, &edit).expect("forge_epub_index 应能解析该 EPUB");
+        eprintln!(
+            "forge_epub_index OK: {} chapters={} blocks={} text_len={}",
+            book.file_name().unwrap_or_default().to_string_lossy(),
+            idx.analysis.chapters.len(),
+            idx.flat_blocks.len(),
+            idx.text.len()
+        );
+        assert!(
+            !idx.analysis.chapters.is_empty(),
+            "章节数为 0：spine/manifest 解析疑似失效"
+        );
+        assert!(!idx.flat_blocks.is_empty(), "正文块数为 0");
+        assert!(idx.text.len() > 100, "提取正文过短");
+        // 中文书必须提取出正常汉字，不能是 latin-1 乱码（è½®å›ž 这种）
+        let name = book.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if name.contains("轮回") {
+            assert!(
+                !idx.text.contains("è½") && !idx.text.contains("å›ž"),
+                "正文解码为乱码：{:.80}",
+                idx.text
+            );
+            assert!(idx.text.contains('，'), "中文正文标点缺失，疑似编码错误");
+        }
+        let _ = fs::remove_dir_all(&edit);
+    }
 }

@@ -615,27 +615,13 @@ fn list_library_books(app: &tauri::AppHandle) -> Vec<BookMeta> {
                 last_opened_at: None,
             };
 
-            // 自动提取封面并缓存到 covers/ 根目录
+            // 封面：已有有效缓存就复用，缺失/损坏则从 EPUB 重新提取
             if fmt == "epub" {
-                if let Ok(bytes) = fs::read(&path) {
-                    if let Some((ext, img_bytes)) = extract_epub_cover(&bytes) {
-                        let _ = ensure_covers_dir(&root);
-                        // 用同一份 sanitize 输出，确保写入文件名和 book.cover 字段完全一致
-                        let safe = sanitize_filename(&title);
-                        let cover_name = format!("{}.{}", safe, ext);
-                        let cover_path = root.join("covers").join(&cover_name);
-                        let _ = fs::write(&cover_path, &img_bytes);
-                        book.cover = Some(cover_name);
-                    }
-                }
+                book.cover = ensure_flat_cover(&root, &title, book.cover.as_deref(), Some(&path));
             }
 
             out.push(book);
         }
-    }
-    // 调试输出：看每本书的 id / cover / path
-    for b in &out {
-        eprintln!("[list_library_books] id={} cover={:?} path={:?}", b.id, b.cover, b.path);
     }
     out
 }
@@ -953,7 +939,8 @@ fn write_cover_meta(app: &tauri::AppHandle, id: &str, name: &str) -> Result<(), 
     fs::write(&meta_path, json).map_err(|e| format!("写入书目失败：{e}"))
 }
 
-/// 保存前端从 EPUB 中抽出的封面，并把封面文件名写进书目。
+/// 保存前端从 EPUB 中抽出的封面。
+/// 扁平书库用「书名.ext」命名（与自动提取一致），旧模型/历史模式仍写 cover.ext 并登记。
 #[tauri::command]
 fn save_cover(app: tauri::AppHandle, id: String, base64: String, ext: String) -> Result<(), String> {
     use base64::Engine as _;
@@ -972,40 +959,58 @@ fn save_cover(app: tauri::AppHandle, id: String, base64: String, ext: String) ->
     if bytes.is_empty() || bytes.len() > 8 * 1024 * 1024 {
         return Err("封面尺寸异常，未保存".into());
     }
+    // 必须是真的图片，避免把 xhtml 之类的页面写进封面目录
+    let real_ext = sniff_image(&bytes).ok_or("封面数据不是有效图片")?;
     let dir = cover_dir(&app, &id)?;
-    let name = format!("cover.{clean}");
+    let book = find_book(&app, &id);
+    let is_history = find_history_entry(&app, &id).is_some();
+    let flat = !is_history
+        && book
+            .as_ref()
+            .and_then(|b| b.path.as_deref())
+            .map(|p| Path::new(p).is_file())
+            .unwrap_or(false);
+    let name = if flat {
+        format!(
+            "{}.{}",
+            sanitize_filename(book.as_ref().map(|b| b.title.as_str()).unwrap_or("")),
+            real_ext
+        )
+    } else {
+        format!("cover.{real_ext}")
+    };
     fs::write(dir.join(&name), &bytes).map_err(|e| format!("写入封面失败：{e}"))?;
+    if flat {
+        return Ok(());
+    }
     write_cover_meta(&app, &id, &name)
 }
 
 /// 读取书目封面原始字节（没有封面时返回空响应）。
-/// 如果磁盘上没封面文件，尝试直接从 epub zip 里提取并缓存。
+/// 只认真正的图片：磁盘上残留的 xhtml / 损坏文件会被忽略并重新提取。
 #[tauri::command]
-fn read_cover(app: tauri::AppHandle, id: String) -> Result<tauri::ipc::Response, String> {    let book = match find_book(&app, &id) {
-        Some(b) => b,
-        None => { eprintln!("[read_cover] find_book FAILED"); return Err("书架上找不到这条书目".to_string()); }
-    };    let Some(name) = book.cover.clone() else {
-        // book.cover 为空 → 尝试从 epub 实时提取
-        if let Some((ext, bytes)) = try_extract_cover_from_book(&app, &book) {
-            // 缓存到 covers/ 目录供下次使用
-            let dir = cover_dir(&app, &id)?;
-            let _ = fs::create_dir_all(&dir);
-            let safe = sanitize_filename(&book.title);
-            let fname = format!("{}.{}", safe, ext);
-            let _ = fs::write(dir.join(&fname), &bytes);
-            return Ok(tauri::ipc::Response::new(bytes));
-        }
-        return Ok(tauri::ipc::Response::new(Vec::<u8>::new()));
-    };
-    // 封面文件名来自 sanitize_filename，已经过滤了路径穿越字符，无需再验证
+fn read_cover(app: tauri::AppHandle, id: String) -> Result<tauri::ipc::Response, String> {
+    let book = find_book(&app, &id).ok_or("书架上找不到这条书目")?;
     let dir = cover_dir(&app, &id)?;
-    let cover_path = dir.join(&name);    let bytes = fs::read(&cover_path).unwrap_or_default();    if bytes.is_empty() {
-        // 文件不存在 → fallback 从 epub 实时提取
-        if let Some((_ext, bytes)) = try_extract_cover_from_book(&app, &book) {
+
+    // ① 书目登记的封面必须通过魔数校验
+    if let Some(name) = book.cover.as_deref() {
+        if let Some((_ext, bytes)) = valid_cover_file(&dir.join(name)) {
             return Ok(tauri::ipc::Response::new(bytes));
         }
     }
-    Ok(tauri::ipc::Response::new(bytes))
+
+    // ② 没有有效缓存 → 从源 EPUB 实时提取并回写
+    if let Some((ext, bytes)) = try_extract_cover_from_book(&app, &book) {
+        let fname = format!("{}.{}", sanitize_filename(&book.title), ext);
+        if fs::create_dir_all(&dir).is_ok() {
+            let _ = fs::write(dir.join(&fname), &bytes);
+        }
+        let _ = write_cover_meta(&app, &id, &fname);
+        return Ok(tauri::ipc::Response::new(bytes));
+    }
+
+    Ok(tauri::ipc::Response::new(Vec::<u8>::new()))
 }
 
 /// 尝试从书的源 epub 文件里实时提取封面（不缓存）
@@ -1014,6 +1019,183 @@ fn try_extract_cover_from_book(app: &tauri::AppHandle, book: &BookMeta) -> Optio
     let Ok(epub_path) = book_source_path(app, book) else { return None };
     let bytes = fs::read(&epub_path).ok()?;
     extract_epub_cover(&bytes)
+}
+
+// ─── 封面记录表与书架自检 ───
+
+/// 磁盘上的封面必须是真图片；xhtml、空文件、损坏数据一律视为无效。
+fn valid_cover_file(path: &Path) -> Option<(String, Vec<u8>)> {
+    let bytes = fs::read(path).ok()?;
+    let ext = sniff_image(&bytes)?;
+    Some((ext.to_string(), bytes))
+}
+
+/// 在 covers/ 里找按书名命名的有效封面（上次提取后书目没来得及登记也能认领）。
+fn find_cached_cover(root: &Path, safe: &str) -> Option<String> {
+    for ext in ["jpg", "jpeg", "png", "webp", "gif"] {
+        let name = format!("{safe}.{ext}");
+        if valid_cover_file(&root.join("covers").join(&name)).is_some() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// 确保扁平书库这本书有可用封面：有效缓存复用 → 规范名认领 → 从 EPUB 重新提取。
+fn ensure_flat_cover(
+    root: &Path,
+    title: &str,
+    existing: Option<&str>,
+    source: Option<&Path>,
+) -> Option<String> {
+    let safe = sanitize_filename(title);
+
+    if let Some(name) = existing {
+        if valid_cover_file(&root.join("covers").join(name)).is_some() {
+            return Some(name.to_string());
+        }
+    }
+    if let Some(name) = find_cached_cover(root, &safe) {
+        return Some(name);
+    }
+
+    let source = source?;
+    if source.extension().and_then(|e| e.to_str()) != Some("epub") {
+        return None;
+    }
+    let bytes = fs::read(source).ok()?;
+    let (ext, img) = extract_epub_cover(&bytes)?;
+    ensure_covers_dir(root).ok()?;
+    let name = format!("{safe}.{ext}");
+    fs::write(root.join("covers").join(&name), &img).ok()?;
+    Some(name)
+}
+
+/// 书架自检报告
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ShelfHealthReport {
+    /// 本次检查的书目数量
+    scanned: usize,
+    /// 重新生成/修复封面的数量
+    covers_repaired: usize,
+    /// 删除的无效或冗余封面文件数
+    covers_removed: usize,
+    /// 封面修复涉及的书名
+    repaired_titles: Vec<String>,
+    /// 删除的封面文件名
+    removed_files: Vec<String>,
+    /// 正文文件缺失的书名
+    missing_sources: Vec<String>,
+    /// 确实提取不到封面的书名（正文正常但 EPUB 里没有封面图）
+    uncovered_titles: Vec<String>,
+}
+
+/// 书架自检：启动与「刷新书架」共用。
+/// 1) 每本书校验封面，损坏/缺失就重建；2) 清理 covers/ 里的非图片与无主文件；
+/// 3) 检查正文文件是否还在，缺失的只在报告里列出（绝不删书）。
+#[tauri::command]
+fn shelf_health(app: tauri::AppHandle) -> Result<ShelfHealthReport, String> {
+    let mut report = ShelfHealthReport::default();
+    let Ok(root) = books_root(&app) else {
+        return Ok(report);
+    };
+    let covers = root.join("covers");
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // ① 扁平书库：正文存在性 + 封面修复
+    for book in list_library_books(&app) {
+        report.scanned += 1;
+        let source = book.path.as_ref().map(PathBuf::from);
+        if !source.as_ref().map(|p| p.is_file()).unwrap_or(false)
+            && book_source_path(&app, &book).is_err()
+        {
+            report.missing_sources.push(book.title.clone());
+            continue;
+        }
+        // 旧子文件夹模型的封面放在书目录里，这里只管扁平模型
+        let Some(source) = source.filter(|p| p.is_file()) else {
+            continue;
+        };
+        if book.format != "epub" {
+            continue;
+        }
+        let title = book.title.clone();
+        match ensure_flat_cover(&root, &title, book.cover.as_deref(), Some(&source)) {
+            Some(name) => {
+                if book.cover.as_deref() != Some(name.as_str()) {
+                    report.covers_repaired += 1;
+                    report.repaired_titles.push(title.clone());
+                }
+                keep.insert(name);
+                // 同名的其它图片扩展名也算这本书的合法封面，避免误删
+                let safe = sanitize_filename(&title);
+                for ext in ["jpg", "jpeg", "png", "webp", "gif"] {
+                    keep.insert(format!("{safe}.{ext}"));
+                }
+            }
+            None => report.uncovered_titles.push(title),
+        }
+    }
+
+    // ② 历史模式：封面单独存在 history_covers/<id>/
+    let mut history = read_history(&app);
+    let mut history_dirty = false;
+    if let Ok(hdir) = history_covers_dir(&app) {
+        for entry in history.iter_mut() {
+            report.scanned += 1;
+            if !Path::new(&entry.path).is_file() {
+                report.missing_sources.push(entry.title.clone());
+                continue;
+            }
+            if entry.format != "epub" {
+                continue;
+            }
+            let dir = hdir.join(&entry.id);
+            let current_ok = entry
+                .cover
+                .as_ref()
+                .and_then(|name| valid_cover_file(&dir.join(name)))
+                .is_some();
+            if current_ok {
+                continue;
+            }
+            if let Some((ext, img)) = try_extract_cover_from_book(&app, &entry.to_book()) {
+                let _ = fs::create_dir_all(&dir);
+                let safe = sanitize_filename(&entry.title);
+                let name = format!("{safe}.{ext}");
+                if fs::write(dir.join(&name), &img).is_ok() {
+                    entry.cover = Some(name);
+                    history_dirty = true;
+                    report.covers_repaired += 1;
+                    report.repaired_titles.push(entry.title.clone());
+                }
+            }
+        }
+    }
+    if history_dirty {
+        let _ = write_history(&app, &history);
+    }
+
+    // ③ 清理 covers/：非图片文件、以及不属于任何一本书的冗余文件
+    if let Ok(entries) = fs::read_dir(&covers) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_image = valid_cover_file(&path).is_some();
+            if !is_image || !keep.contains(&name) {
+                if fs::remove_file(&path).is_ok() {
+                    report.covers_removed += 1;
+                    report.removed_files.push(name);
+                }
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 /// 把前端生成的 EPUB 二进制写入用户选定路径。
@@ -2123,98 +2305,259 @@ fn extract_opf_title(epub_bytes: &[u8]) -> Result<String, String> {
     Ok(title)
 }
 
-/// 从 epub 里尝试提取封面（OPF 找 cover-image meta → 从 zip 读图片）
-fn extract_epub_cover(epub_bytes: &[u8]) -> Option<(String, Vec<u8>)> {
-    use zip::ZipArchive;
-    use std::io::{Cursor, Read};
-    let mut archive = ZipArchive::new(Cursor::new(epub_bytes)).ok()?;
+/// 单个 manifest 条目的必要属性
+struct OpfItemRef {
+    id: String,
+    href: String,
+    media: String,
+    props: String,
+}
 
-    // 先找 container.xml → OPF
-    let mut opf_path = String::new();
-    let mut opf_dir = String::new();
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).ok()?;
-        if f.name() == "META-INF/container.xml" {
-            let mut buf = String::new();
-            let _ = f.read_to_string(&mut buf);
-            if let Some(idx) = buf.find("full-path=\"") {
-                let start = idx + 11;
-                if let Some(end) = buf[start..].find('"') {
-                    opf_path = buf[start..start + end].to_string();
+/// 取标签里的属性值（同时兼容双引号与单引号）
+fn tag_attr(tag: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(pos) = tag[from..].find(name) {
+        let start = from + pos;
+        let before_ok = start == 0 || {
+            let b = tag.as_bytes()[start - 1];
+            !b.is_ascii_alphanumeric() && b != b'-'
+        };
+        if before_ok {
+            let rest = tag[start + name.len()..].trim_start();
+            if let Some(r) = rest.strip_prefix('=') {
+                let r = r.trim_start();
+                if let Some(quote) = r.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                    let inner = &r[1..];
+                    if let Some(end) = inner.find(quote) {
+                        return Some(inner[..end].to_string());
+                    }
                 }
             }
-            break;
         }
+        from = start + name.len();
     }
-    if opf_path.is_empty() { return None; }
-    if let Some(idx) = opf_path.rfind('/') {
-        opf_dir = opf_path[..=idx].to_string();
-    }
+    None
+}
 
-    // 读 OPF → 找 meta name="cover" content="xxx"
-    let mut opf_content = String::new();
+/// 扫描 OPF 里所有 <item .../>（自闭合与普通标签都能识别，属性顺序无关）
+fn opf_manifest_refs(opf: &str) -> Vec<OpfItemRef> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(rel) = opf[i..].find("<item") {
+        let start = i + rel;
+        let tail = &opf[start + 5..];
+        if !tail.starts_with(|c: char| c.is_whitespace() || c == '/' || c == '>') {
+            i = start + 5;
+            continue;
+        }
+        let Some(gt) = opf[start..].find('>') else { break };
+        let end = start + gt;
+        let tag = &opf[start..=end];
+        let href = tag_attr(tag, "href").unwrap_or_default();
+        if !href.is_empty() {
+            out.push(OpfItemRef {
+                id: tag_attr(tag, "id").unwrap_or_default(),
+                href,
+                media: tag_attr(tag, "media-type").unwrap_or_default(),
+                props: tag_attr(tag, "properties").unwrap_or_default(),
+            });
+        }
+        i = end + 1;
+    }
+    out
+}
+
+/// EPUB2 的 <meta name="cover" content="ID"/>
+fn opf_meta_cover_id(opf: &str) -> Option<String> {
+    let mut i = 0usize;
+    while let Some(rel) = opf[i..].find("<meta") {
+        let start = i + rel;
+        let tail = &opf[start + 5..];
+        if !tail.starts_with(|c: char| c.is_whitespace() || c == '/' || c == '>') {
+            i = start + 5;
+            continue;
+        }
+        let Some(gt) = opf[start..].find('>') else { break };
+        let end = start + gt;
+        let tag = &opf[start..=end];
+        if tag_attr(tag, "name").as_deref() == Some("cover") {
+            if let Some(id) = tag_attr(tag, "content") {
+                if !id.trim().is_empty() {
+                    return Some(id.trim().to_string());
+                }
+            }
+        }
+        i = end + 1;
+    }
+    None
+}
+
+fn is_image_ext(ext: &str) -> bool {
+    matches!(ext, "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp")
+}
+
+/// 用魔数判断真实图片类型，避免把 xhtml 当封面缓存
+fn sniff_image(data: &[u8]) -> Option<&'static str> {
+    if data.len() < 12 || data.len() > 8 * 1024 * 1024 {
+        return None;
+    }
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        Some("png")
+    } else if data.starts_with(b"GIF8") {
+        Some("gif")
+    } else if &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("webp")
+    } else if data.starts_with(b"BM") {
+        Some("bmp")
+    } else {
+        None
+    }
+}
+
+fn zip_entry_bytes(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    name: &str,
+) -> Option<Vec<u8>> {
     for i in 0..archive.len() {
         let mut f = archive.by_index(i).ok()?;
-        if f.name() == opf_path || f.name().ends_with(&opf_path) {
-            let _ = f.read_to_string(&mut opf_content);
-            break;
+        if f.name().replace('\\', "/") == name {
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut data).ok()?;
+            return Some(data);
         }
     }
+    None
+}
 
-    // ③ 找 cover（两步：先拿 cover ID → 再查 manifest 找 href）
-    let cover_href = {
-        let cover_id = opf_content
-            .match_indices("name=\"cover\"")
-            .next()
-            .and_then(|(idx, _)| {
-                let after = &opf_content[idx..idx + 300];
-                let ci = after.find("content=\"")?;
-                let start = ci + 9;
-                let end = after[start..].find('"')?;
-                Some(after[start..start + end].to_string())
-            });
-
-        if let Some(cid) = cover_id {
-            // OPF 3：content 是 manifest item ID → 查 manifest 找 id="cid" 的 href
-            let pat = format!("id=\"{}\"", cid);
-            if let Some((idx, _)) = opf_content.match_indices(&pat).next() {
-                // 在全字符串上工作，避免 UTF-8 字节切片 panic
-                let prefix = &opf_content[..idx];
-                if let Some(hi) = prefix.rfind("href=\"") {
-                    let start = hi + 6;
-                    if let Some(end) = opf_content[start..].find('"') {
-                        opf_content[start..start + end].to_string()
-                    } else { String::new() }
-                } else { String::new() }
-            } else { String::new() }
-        } else {
-            // Fallback：OPF 2 或无 name=cover → 找 properties="cover-image" 的 href
-            if let Some((idx, _)) = opf_content.match_indices("cover-image").next() {
-                let prefix = &opf_content[..idx];
-                if let Some(hi) = prefix.rfind("href=\"") {
-                    let start = hi + 6;
-                    if let Some(end) = opf_content[start..].find('"') {
-                        opf_content[start..start + end].to_string()
-                    } else { String::new() }
-                } else { String::new() }
-            } else { String::new() }
+/// 把相对路径拼到 zip 内目录，并处理 ./ 与 ../
+fn join_zip_path(base_dir: &str, rel: &str) -> String {
+    let mut parts: Vec<&str> = if rel.starts_with('/') {
+        Vec::new()
+    } else {
+        base_dir.split('/').filter(|s| !s.is_empty()).collect()
+    };
+    for seg in rel.trim_start_matches('/').split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
         }
+    }
+    parts.join("/")
+}
+
+/// 从 XHTML 封面页里找内嵌图片路径
+fn image_src_in_xhtml(raw: &str) -> Option<String> {
+    let mut i = 0usize;
+    while let Some(rel) = raw[i..].find('<') {
+        let start = i + rel;
+        let tag_end = start + raw[start..].find('>')?;
+        let tag = &raw[start..=tag_end];
+        let lower = tag.to_ascii_lowercase();
+        if lower.starts_with("<img") || lower.starts_with("<image") {
+            if let Some(src) = tag_attr(tag, "src").or_else(|| tag_attr(tag, "href")) {
+                if !src.starts_with("data:") && !src.contains("://") {
+                    return Some(src);
+                }
+            }
+        }
+        i = tag_end + 1;
+    }
+    None
+}
+
+/// 从 epub 里提取封面：先按 manifest 找 cover-image，再回退到 cover 页里的 <img>，最后按文件名兜底。
+/// 返回值一定经过魔数校验，调用方可以安全地当作图片缓存。
+fn extract_epub_cover(epub_bytes: &[u8]) -> Option<(String, Vec<u8>)> {
+    use std::io::Cursor;
+    use zip::ZipArchive;
+
+    let mut archive = ZipArchive::new(Cursor::new(epub_bytes)).ok()?;
+
+    // container.xml → OPF 路径
+    let container = zip_entry_bytes(&mut archive, "META-INF/container.xml")?;
+    let container = String::from_utf8_lossy(&container);
+    let opf_path = {
+        let marker = "full-path=\"";
+        let idx = container.find(marker)? + marker.len();
+        let end = container[idx..].find('"')?;
+        container[idx..idx + end].to_string()
+    };
+    if opf_path.is_empty() {
+        return None;
+    }
+    let opf_dir = match opf_path.rfind('/') {
+        Some(idx) => opf_path[..=idx].to_string(),
+        None => String::new(),
     };
 
-    if cover_href.is_empty() { return None; }
+    let opf_raw = zip_entry_bytes(&mut archive, &opf_path.replace('\\', "/"))?;
+    let opf = String::from_utf8_lossy(&opf_raw);
+    let items = opf_manifest_refs(&opf);
 
-    let full = format!("{}{}", opf_dir, cover_href);
-    let ext = cover_href.rsplit('.').next().unwrap_or("jpg").to_lowercase();
+    // 候选 1：properties 里带 cover-image
+    // 候选 2：EPUB2 meta name="cover" 指向的 id
+    // 候选 3：id 含 cover 且 media 是图片
+    let mut candidates: Vec<&OpfItemRef> = Vec::new();
+    if let Some(item) = items.iter().find(|it| {
+        it.props
+            .split_whitespace()
+            .any(|p| p.eq_ignore_ascii_case("cover-image"))
+    }) {
+        candidates.push(item);
+    }
+    if let Some(cid) = opf_meta_cover_id(&opf) {
+        if let Some(item) = items.iter().find(|it| it.id == cid) {
+            candidates.push(item);
+        }
+    }
+    if let Some(item) = items.iter().find(|it| {
+        it.id.to_ascii_lowercase().contains("cover")
+            && it.media.to_ascii_lowercase().starts_with("image/")
+    }) {
+        candidates.push(item);
+    }
 
-    // 从 zip 读图片
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i).ok()?;
-        let name = f.name();
-        if name == full || name.ends_with(&cover_href) {
-            let mut data = Vec::new();
-            let _ = f.read_to_end(&mut data);
-            if !data.is_empty() {
-                return Some((ext, data));
+    for item in candidates {
+        let page_full = join_zip_path(&opf_dir, &item.href);
+        let ext = page_full.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        if is_image_ext(&ext) {
+            if let Some(data) = zip_entry_bytes(&mut archive, &page_full) {
+                if let Some(real) = sniff_image(&data) {
+                    return Some((real.to_string(), data));
+                }
+            }
+            continue;
+        }
+        // cover.xhtml 之类的封面页 → 从页面里再挖出真正的图片
+        if let Some(page) = zip_entry_bytes(&mut archive, &page_full) {
+            let page = String::from_utf8_lossy(&page);
+            if let Some(src) = image_src_in_xhtml(&page) {
+                let img_full = join_zip_path(&opf_dir, &join_zip_path(&page_full, &src));
+                if let Some(data) = zip_entry_bytes(&mut archive, &img_full) {
+                    if let Some(real) = sniff_image(&data) {
+                        return Some((real.to_string(), data));
+                    }
+                }
+            }
+        }
+    }
+
+    // 最后兜底：zip 里名字带 cover 的图片
+    let names: Vec<String> = (0..archive.len())
+        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().replace('\\', "/")))
+        .collect();
+    for name in names {
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("cover") && is_image_ext(lower.rsplit('.').next().unwrap_or("")) {
+            if let Some(data) = zip_entry_bytes(&mut archive, &name) {
+                if let Some(real) = sniff_image(&data) {
+                    return Some((real.to_string(), data));
+                }
             }
         }
     }
@@ -2278,6 +2621,41 @@ mod tests {
         }
     }
 
+    /// 回归测试：外部 EPUB（OPF 自闭合标签 + cover 页间接引用图片）必须抽到真图片，不能返回 xhtml。
+    #[test]
+    fn extract_epub_cover_handles_external_opf_books() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../local book repository");
+        let samples: Vec<PathBuf> = fs::read_dir(&repo)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("轮回第7次的反派千金"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if samples.is_empty() {
+            eprintln!("skip: 书库中没有样本");
+            return;
+        }
+        for path in samples {
+            let bytes = fs::read(&path).expect("read epub");
+            let (ext, img) = extract_epub_cover(&bytes)
+                .unwrap_or_else(|| panic!("封面提取失败：{:?}", path));
+            assert!(img.len() > 1000, "封面过小（疑似垃圾数据）：{:?}", path);
+            assert!(sniff_image(&img).is_some(), "封面不是有效图片：{:?}", path);
+            eprintln!(
+                "✅ {} -> {} ({} bytes)",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                ext,
+                img.len()
+            );
+        }
+    }
+
     #[test]
     fn bundled_epubcheck_passes_library_book() {
         let base = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2310,6 +2688,7 @@ fn main() {
             read_book,
             import_book,
             list_books,
+            shelf_health,
             read_book_bytes,
             save_cover,
             read_cover,
