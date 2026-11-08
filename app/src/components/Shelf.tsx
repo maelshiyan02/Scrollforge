@@ -5,6 +5,7 @@ import { lastReadAt, progressPercent } from '../lib/progress'
 import { coverUrl } from '../lib/cover'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import Icon from './Icon'
+import { SortImportedIcon, SortOrderIcon, SortRecentIcon, SortTitleIcon } from './SortIcons'
 import WindowControls from './WindowControls'
 import Shelf3D from './Shelf3D'
 
@@ -34,7 +35,6 @@ type Category = 'all' | 'reading' | 'unread' | 'done' | 'epub' | 'txt' | 'recent
 
 const SORT_NEXT: Sort[] = ['recent', 'imported', 'title']
 const SORT_LABEL: Record<Sort, string> = { recent: '最近阅读', imported: '导入时间', title: '书名 A-Z' }
-const SORT_ICON: Record<Sort, string> = { recent: 'schedule', imported: 'file_download', title: 'sort_by_alpha' }
 
 const SHELF_KEY = 'scrollforge:shelf'
 const EMPTY_CATEGORY: Category = 'all'
@@ -434,7 +434,13 @@ export default function Shelf({
             aria-label="切换排序方式"
             onClick={cycleSort}
           >
-            <Icon name={SORT_ICON[sort]} />
+            {sort === 'recent' ? (
+              <SortRecentIcon />
+            ) : sort === 'imported' ? (
+              <SortImportedIcon />
+            ) : (
+              <SortTitleIcon />
+            )}
           </button>
           <button
             className="btn icon-only"
@@ -442,7 +448,7 @@ export default function Shelf({
             aria-label="切换排序方向"
             onClick={toggleOrder}
           >
-            <Icon name={order === 'asc' ? 'arrow_upward' : 'arrow_downward'} />
+            <SortOrderIcon asc={order === 'asc'} />
           </button>
           <button
             className={`btn icon-only ${view === 'grid' ? 'on' : ''}`}
