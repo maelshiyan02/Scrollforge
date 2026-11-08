@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import '../vendor/foliate-js/view.js'
 import { FootnoteHandler } from '../vendor/foliate-js/footnotes.js'
 import AnnotationTools from './AnnotationTools'
@@ -7,6 +8,7 @@ import ForgePanel from './ForgePanel'
 import EpubEditPanel from './EpubEditPanel'
 import Icon from './Icon'
 import ImageViewer, { type ViewerImage } from './ImageViewer'
+import WindowControls from './WindowControls'
 import { decodeText } from '../lib/encoding'
 import { toPlainText } from '../lib/book-text'
 import { analyzeTxt, type TxtAnalysis } from '../lib/txt-chapters'
@@ -1079,7 +1081,14 @@ export default function Reader({
 
   return (
     <div className="app">
-      <header className="bar">
+      <header
+        className="bar titlebar"
+        data-tauri-drag-region
+        onDoubleClick={(event) => {
+          if ((event.target as HTMLElement).closest('button, select, input, label, a')) return
+          void getCurrentWindow().toggleMaximize()
+        }}
+      >
         <button className="btn icon-only" data-tip="返回书架（Esc）" aria-label="返回书架" onClick={onBack}>
           <Icon name="arrow_back" />
         </button>
@@ -1239,8 +1248,9 @@ export default function Reader({
         >
           <Icon name={prefs.theme === 'night' ? 'brightness_3' : prefs.theme === 'eye' ? 'visibility' : 'wb_sunny'} />
         </button>
-        <span className="grow" />
+        <span className="grow" data-tauri-drag-region />
         <span className="bookname" title={title}>{title || '未打开书籍'}</span>
+        <WindowControls />
       </header>
 
       <main className="stage">

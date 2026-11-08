@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AppSettings, BookMeta } from '../types'
-import { nextTheme, themeLabel, type Prefs } from '../lib/prefs'
+import { nextTheme, themeLabel, type Prefs, type ShelfSortOrder } from '../lib/prefs'
 import { lastReadAt, progressPercent } from '../lib/progress'
 import { coverUrl } from '../lib/cover'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import Icon from './Icon'
+import WindowControls from './WindowControls'
 import Shelf3D from './Shelf3D'
 
 type Props = {
@@ -29,6 +31,10 @@ type View = 'grid' | 'list' | 'shelf3d'
 type Sort = 'recent' | 'imported' | 'title'
 type Tab = 'history' | 'library'
 type Category = 'all' | 'reading' | 'unread' | 'done' | 'epub' | 'txt' | 'recent' | `group:${string}`
+
+const SORT_NEXT: Sort[] = ['recent', 'imported', 'title']
+const SORT_LABEL: Record<Sort, string> = { recent: '最近阅读', imported: '导入时间', title: '书名 A-Z' }
+const SORT_ICON: Record<Sort, string> = { recent: 'schedule', imported: 'file_download', title: 'sort_by_alpha' }
 
 const SHELF_KEY = 'scrollforge:shelf'
 const EMPTY_CATEGORY: Category = 'all'
@@ -135,6 +141,7 @@ export default function Shelf({
 }: Props) {
   const [view, setView] = useState<View>(prefs.shelfView)
   const [sort, setSort] = useState<Sort>(prefs.shelfSort)
+  const [order, setOrder] = useState<ShelfSortOrder>(prefs.shelfSortOrder)
   const [tab, setTab] = useState<Tab>(() => loadPref<Tab>('tab', 'library', ['history', 'library']))
   const [category, setCategory] = useState<Category>(() => {
     const raw = localStorage.getItem(`${SHELF_KEY}:category`)
@@ -152,14 +159,26 @@ export default function Shelf({
   // 设置页改了默认视图/排序后，已打开的书架立即跟随
   useEffect(() => setView(prefs.shelfView), [prefs.shelfView])
   useEffect(() => setSort(prefs.shelfSort), [prefs.shelfSort])
+  useEffect(() => setOrder(prefs.shelfSortOrder), [prefs.shelfSortOrder])
 
   const changeView = (value: View) => {
     setView(value)
     onPrefs({ shelfView: value })
   }
   const changeSort = (value: Sort) => {
+    // 时间类默认新→旧，书名默认 A→Z
+    const nextOrder: ShelfSortOrder = value === 'title' ? 'asc' : 'desc'
     setSort(value)
-    onPrefs({ shelfSort: value })
+    setOrder(nextOrder)
+    onPrefs({ shelfSort: value, shelfSortOrder: nextOrder })
+  }
+  const cycleSort = () => {
+    changeSort(SORT_NEXT[(SORT_NEXT.indexOf(sort) + 1) % SORT_NEXT.length])
+  }
+  const toggleOrder = () => {
+    const next: ShelfSortOrder = order === 'asc' ? 'desc' : 'asc'
+    setOrder(next)
+    onPrefs({ shelfSortOrder: next })
   }
   useEffect(() => {
     try {
@@ -261,14 +280,15 @@ export default function Shelf({
       return true
     })
     const sorted = [...filtered]
+    const dir = order === 'asc' ? 1 : -1
     sorted.sort((a, b) => {
-      if (sort === 'title') return a.title.localeCompare(b.title, 'zh-Hans-CN')
-      if (sort === 'imported') return b.importedAt - a.importedAt
-      if (tab === 'history') return lastOpened(b) - lastOpened(a)
-      return Math.max(lastOpened(b), b.importedAt) - Math.max(lastOpened(a), a.importedAt)
+      if (sort === 'title') return a.title.localeCompare(b.title, 'zh-Hans-CN') * dir
+      if (sort === 'imported') return (a.importedAt - b.importedAt) * dir
+      if (tab === 'history') return (lastOpened(a) - lastOpened(b)) * dir
+      return (Math.max(lastOpened(a), a.importedAt) - Math.max(lastOpened(b), b.importedAt)) * dir
     })
     return sorted
-  }, [sourceBooks, category, sort, tab])
+  }, [sourceBooks, category, sort, order, tab])
 
   const contextMenu = (event: React.MouseEvent, book: BookMeta) => {
     event.preventDefault()
@@ -325,8 +345,16 @@ export default function Shelf({
 
   return (
     <div className="shelf-page">
-      <header className="shelf-bar">
-        <div className="brand">
+      <header
+        className="shelf-bar titlebar"
+        data-tauri-drag-region
+        onDoubleClick={(event) => {
+          if ((event.target as HTMLElement).closest('button, select, input, label, a')) return
+          void getCurrentWindow().toggleMaximize()
+        }}
+      >
+        <div className="brand" data-tauri-drag-region>
+          <img className="brand-icon" src="/app-icon.png" alt="" />
           <span className="brand-name">Scrollforge</span>
           <span className="brand-page">书架</span>
         </div>
@@ -362,15 +390,8 @@ export default function Shelf({
         >
           <Icon name="swap_horiz" />
         </button>
-        <span className="grow" />
-        <label className="field" title="选择书架排序方式">
-          <span>排序</span>
-          <select value={sort} onChange={(e) => changeSort(e.target.value as Sort)}>
-            <option value="recent">最近阅读</option>
-            <option value="imported">导入时间</option>
-            <option value="title">书名</option>
-          </select>
-        </label>
+        <span className="grow" data-tauri-drag-region />
+        <WindowControls />
       </header>
 
       <div className="shelf-subbar">
@@ -407,6 +428,22 @@ export default function Shelf({
           ))}
         </div>
         <div className="subbar-tools">
+          <button
+            className="btn icon-only"
+            data-tip={`排序方式：${SORT_LABEL[sort]}（点击切换阅读时间 / 导入时间 / 书名）`}
+            aria-label="切换排序方式"
+            onClick={cycleSort}
+          >
+            <Icon name={SORT_ICON[sort]} />
+          </button>
+          <button
+            className="btn icon-only"
+            data-tip={`排序方向：${order === 'asc' ? '升序' : '降序'}（点击切换）`}
+            aria-label="切换排序方向"
+            onClick={toggleOrder}
+          >
+            <Icon name={order === 'asc' ? 'arrow_upward' : 'arrow_downward'} />
+          </button>
           <button
             className={`btn icon-only ${view === 'grid' ? 'on' : ''}`}
             data-tip="网格视图（看封面）"

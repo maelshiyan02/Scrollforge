@@ -4587,3 +4587,52 @@ kbd {
 /* 夜间滚动条轨道跟随表面色 */
 :root[data-theme="night"] ::-webkit-scrollbar-track { background: var(--surface-2); }
 :root[data-theme="night"] ::-webkit-scrollbar-thumb { background: var(--line-strong); }
+
+
+/* ========== 自定义标题栏（W29） ========== */
+:root { --titlebar-h: 56px; }
+
+/* 两页顶栏统一高度，右侧不留内边距，窗口按钮贴边 */
+.titlebar {
+  height: var(--titlebar-h);
+  padding-right: 0;
+}
+
+.shelf-bar .brand { align-items: center; }
+.brand-icon { width: 24px; height: 24px; border-radius: 6px; flex: none; }
+.brand-name { font-size: 18px; }
+
+.win-controls {
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+  height: 100%;
+  flex: none;
+}
+.win-btn {
+  width: 46px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.win-btn:hover { background: var(--surface-2); }
+.win-btn:active { background: var(--line); }
+.win-btn.close:hover,
+.win-btn.close:active { background: var(--danger); color: #fff; }
+
+/* 窗口按钮在最右侧，说明向左展开避免被裁 */
+.win-controls [data-tip]::after { left: auto; right: 6px; transform: translateY(-2px); }
+.win-controls [data-tip]:hover::after { transform: translateY(0); }
+
+/* 窄窗口优先保住窗口按钮，书名让位 */
+@media (max-width: 1100px) {
+  .bar .bookname { display: none; }
+}

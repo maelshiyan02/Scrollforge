@@ -3,6 +3,8 @@
 export type ReaderFlow = 'paginated' | 'scrolled'
 export type ShelfView = 'grid' | 'list' | 'shelf3d'
 export type ShelfSort = 'recent' | 'imported' | 'title'
+/** 书架排序方向：asc 升序 / desc 降序 */
+export type ShelfSortOrder = 'asc' | 'desc'
 export type ConvertPreset = 'zh-serif' | 'en-serif' | 'minimal'
 export type TranslateMode = 'auto' | 'local' | 'online'
 export type TranslateStyle = 'literary' | 'faithful' | 'casual'
@@ -24,6 +26,8 @@ export type Prefs = {
   shelfView: ShelfView
   /** 书架默认排序 */
   shelfSort: ShelfSort
+  /** 书架排序方向 */
+  shelfSortOrder: ShelfSortOrder
   /** 编辑器段落预览字号 */
   editorBlockFont: number
   /** 编辑器源码字号 */
@@ -69,6 +73,7 @@ export const DEFAULT_PREFS: Prefs = {
   readerVertical: false,
   shelfView: 'grid',
   shelfSort: 'recent',
+  shelfSortOrder: 'desc',
   editorBlockFont: 15,
   editorSrcFont: 12,
   editorAutoRebuild: true,
@@ -96,6 +101,7 @@ const THEMES: ThemeMode[] = ['day', 'eye', 'night']
 const THEME_LABEL: Record<ThemeMode, string> = { day: '日间', eye: '护眼', night: '夜间' }
 const SHELF_VIEWS: ShelfView[] = ['grid', 'list', 'shelf3d']
 const SHELF_SORTS: ShelfSort[] = ['recent', 'imported', 'title']
+const SHELF_SORT_ORDERS: ShelfSortOrder[] = ['asc', 'desc']
 const READER_FLOWS: ReaderFlow[] = ['paginated', 'scrolled']
 const PRESETS: ConvertPreset[] = ['zh-serif', 'en-serif', 'minimal']
 const TRANSLATE_MODES: TranslateMode[] = ['auto', 'local', 'online']
@@ -129,6 +135,7 @@ export function loadPrefs(): Prefs {
         readerVertical: Boolean(parsed.readerVertical),
         shelfView: pick(parsed.shelfView, SHELF_VIEWS, DEFAULT_PREFS.shelfView),
         shelfSort: pick(parsed.shelfSort, SHELF_SORTS, DEFAULT_PREFS.shelfSort),
+        shelfSortOrder: pick(parsed.shelfSortOrder, SHELF_SORT_ORDERS, DEFAULT_PREFS.shelfSortOrder),
         editorBlockFont: clampNumber(parsed.editorBlockFont, 11, 34, DEFAULT_PREFS.editorBlockFont),
         editorSrcFont: clampNumber(parsed.editorSrcFont, 9, 28, DEFAULT_PREFS.editorSrcFont),
         editorAutoRebuild: parsed.editorAutoRebuild !== false,
