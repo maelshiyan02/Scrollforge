@@ -48,6 +48,14 @@ app/dist/
 app/src-tauri/resources/runtime/
 app/src-tauri/resources/epubcheck/
 
+# 内置离线翻译模型（nllb_600m，约 865MB，按需下载）
+models/
+
+# 一次性调试脚本与临时启动器
+.tmp/
+.tmp-*.mjs
+.tmp-*.js
+
 # 用户产物：书库副本 / 导出文件 / 阅读历史（含版权内容，绝不入库）
 local book repository/
 final export/

@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod epub_edit;
+mod nmt;
+mod translate_project;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -39,6 +41,12 @@ struct BookMeta {
     /// 最近一次打开时间（0 表示从未打开）
     #[serde(default)]
     last_opened_at: Option<i64>,
+    /// 书库中的可读目录名（如「三体__a1b2c3」）；历史模式为空
+    #[serde(default)]
+    dirname: Option<String>,
+    /// 母本导入时的指纹（FNV-1a 64 + 字节数），用于发现正文被外部替换
+    #[serde(default)]
+    source_fingerprint: Option<String>,
 }
 
 fn default_storage() -> String {
@@ -150,6 +158,8 @@ impl HistoryEntry {
             path: Some(self.path.clone()),
             group: None,
             last_opened_at: Some(self.last_opened_at),
+            dirname: None,
+            source_fingerprint: None,
         }
     }
 }
@@ -342,10 +352,510 @@ fn valid_id(id: &str) -> bool {
 }
 
 fn book_dir(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
+    resolve_book_dir(app, id)
+}
+
+// ─── 书库目录可读命名与索引（S5） ───
+//
+// 旧模型把书直接摊在书库根目录，id 是 `flat_<文件名hash>`，资源管理器里只看到
+// 一堆书名文件加若干 flat_xxx 工作目录。新模型统一为：
+//   <书名>__<短编号>/source.<ext> + meta.json（+ 阅读/锻造/修订数据）
+// id 保持不变，保证进度、修订、锻造草稿不会因为改名而失联。
+
+const LIBRARY_INDEX_FILE: &str = "library-index.json";
+
+/// 由书 id 派生的 6 位短编号，写在目录名末尾防同名冲突。
+fn short_id(id: &str) -> String {
+    format!("{:06x}", simple_hash(id) & 0x00ff_ffff)
+}
+
+/// 可读目录名：清洗 Windows 非法字符，截断到 40 字，追加短编号。
+fn dir_name_for(title: &str, id: &str) -> String {
+    let base: String = sanitize_filename(title.trim())
+        .chars()
+        .take(40)
+        .collect::<String>()
+        .trim()
+        .trim_end_matches('.')
+        .to_string();
+    let base = if base.is_empty() { "未命名".to_string() } else { base };
+    format!("{base}__{}", short_id(id))
+}
+
+fn read_book_meta(dir: &Path) -> Option<BookMeta> {
+    let text = fs::read_to_string(dir.join("meta.json")).ok()?;
+    serde_json::from_str::<BookMeta>(&text).ok()
+}
+
+fn write_book_meta(dir: &Path, book: &BookMeta) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(book).map_err(|e| format!("序列化书目失败：{e}"))?;
+    fs::write(dir.join("meta.json"), json).map_err(|e| format!("写入书目失败：{e}"))
+}
+
+/// 目录里的正文文件：优先 source.<格式>，再兼容历史的 source.epub / source.txt。
+fn source_in_dir(dir: &Path, format: &str) -> Option<PathBuf> {
+    let direct = dir.join(source_name_of(format));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    for legacy in ["source.epub", "source.txt", "source.md", "source.html"] {
+        let path = dir.join(legacy);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// 计算文件指纹（流式 FNV-1a 64，带字节数，几十万本也不额外吃内存）。
+fn file_fingerprint(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut len: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        len += n as u64;
+        for byte in &buf[..n] {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    Some(format!("fnv1a:{len}:{hash:016x}"))
+}
+
+fn bytes_fingerprint(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv1a:{}:{hash:016x}", bytes.len())
+}
+
+/// 目标目录：能复用同 id 的既有目录就复用，冲突时追加 -2/-3。
+fn unique_book_dir(root: &Path, title: &str, id: &str) -> PathBuf {
+    let base = dir_name_for(title, id);
+    let first = root.join(&base);
+    if !first.exists() || read_book_meta(&first).map(|b| b.id == id).unwrap_or(false) {
+        return first;
+    }
+    for n in 2..100 {
+        let alt = root.join(format!("{base}-{n}"));
+        if !alt.exists() || read_book_meta(&alt).map(|b| b.id == id).unwrap_or(false) {
+            return alt;
+        }
+    }
+    root.join(format!("{base}-{}", now_millis()))
+}
+
+/// 把一个路径（文件或目录）移动到目标；跨盘时退回复制 + 删除。
+fn move_path(from: &Path, to: &Path) -> Result<(), String> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    if from.is_dir() {
+        copy_dir_all(from, to)?;
+        fs::remove_dir_all(from).map_err(|e| format!("清理旧目录失败：{e}"))
+    } else {
+        fs::copy(from, to).map_err(|e| format!("复制文件失败：{e}"))?;
+        let _ = fs::remove_file(from);
+        Ok(())
+    }
+}
+
+/// 把旧工作目录（flat_xxx 里的 forge_edit / revisions / 草稿）并入新书目录。
+fn merge_work_dir(from: &Path, to: &Path) {
+    if from == to || !from.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if dst.exists() {
+            // 同名目录递归并一层，文件不覆盖，避免丢掉任何一侧的数据
+            if src.is_dir() && dst.is_dir() {
+                merge_work_dir(&src, &dst);
+            }
+            continue;
+        }
+        let _ = move_path(&src, &dst);
+    }
+    let _ = fs::remove_dir(from);
+}
+
+/// 一条索引记录。`sourceFingerprint` 是最近一次检查时的正文指纹。
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LibraryIndexEntry {
+    id: String,
+    dir_name: String,
+    title: String,
+    source_name: String,
+    #[serde(default)]
+    source_fingerprint: Option<String>,
+    #[serde(default)]
+    sidecar: bool,
+    #[serde(default)]
+    translation: bool,
+    #[serde(default)]
+    last_checked_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LibraryIndex {
+    #[serde(default = "library_index_version")]
+    schema_version: u32,
+    #[serde(default)]
+    updated_at: i64,
+    #[serde(default)]
+    books: Vec<LibraryIndexEntry>,
+}
+
+fn library_index_version() -> u32 {
+    1
+}
+
+impl Default for LibraryIndex {
+    fn default() -> Self {
+        Self {
+            schema_version: library_index_version(),
+            updated_at: 0,
+            books: Vec::new(),
+        }
+    }
+}
+
+fn library_index_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(books_root(app)?.join(LIBRARY_INDEX_FILE))
+}
+
+/// 索引缺失或损坏时返回空索引，绝不阻塞书库读取。
+fn load_library_index(app: &tauri::AppHandle) -> LibraryIndex {
+    let Ok(path) = library_index_path(app) else {
+        return LibraryIndex::default();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return LibraryIndex::default();
+    };
+    serde_json::from_str::<LibraryIndex>(&text).unwrap_or_default()
+}
+
+/// 原子写：先写临时文件再替换，避免半截 JSON 让下次启动读不到索引。
+fn save_library_index(app: &tauri::AppHandle, index: &LibraryIndex) -> Result<(), String> {
+    let path = library_index_path(app)?;
+    let json = serde_json::to_string_pretty(index).map_err(|e| format!("序列化索引失败：{e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json).map_err(|e| format!("写入索引失败：{e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("替换索引失败：{e}"))
+}
+
+/// 扫描书库目录，重建索引；指纹优先沿用旧索引，其次用 meta 里导入时的指纹。
+fn rebuild_library_index(app: &tauri::AppHandle, previous: &LibraryIndex) -> LibraryIndex {
+    let Ok(root) = books_root(app) else {
+        return LibraryIndex::default();
+    };
+    let mut books = Vec::new();
+    let Ok(entries) = fs::read_dir(&root) else {
+        return LibraryIndex::default();
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Some(book) = read_book_meta(&dir) else {
+            continue;
+        };
+        // 没有正文的目录不进索引（遗留工作目录会被迁移合并）
+        if source_in_dir(&dir, &book.format).is_none() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        let old = previous.books.iter().find(|item| item.id == book.id);
+        books.push(LibraryIndexEntry {
+            id: book.id.clone(),
+            dir_name,
+            title: book.title.clone(),
+            source_name: book.source_name.clone(),
+            source_fingerprint: old
+                .and_then(|item| item.source_fingerprint.clone())
+                .or_else(|| book.source_fingerprint.clone()),
+            sidecar: has_sidecar_data(&dir),
+            translation: dir.join("forge-draft.json").is_file(),
+            last_checked_at: old.map(|item| item.last_checked_at).unwrap_or(0),
+        });
+    }
+    books.sort_by(|a, b| a.title.cmp(&b.title));
+    LibraryIndex {
+        schema_version: library_index_version(),
+        updated_at: now_millis(),
+        books,
+    }
+}
+
+/// 索引解析：先查索引登记的目录名，再扫各目录的 meta.json，最后退回旧式 <root>/<id>。
+fn resolve_book_dir(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
     if !valid_id(id) {
         return Err("书目编号不合法".into());
     }
-    Ok(books_root(app)?.join(id))
+    let root = books_root(app)?;
+    let index = load_library_index(app);
+    if let Some(entry) = index.books.iter().find(|item| item.id == id) {
+        let dir = root.join(&entry.dir_name);
+        if dir.join("meta.json").is_file() {
+            return Ok(dir);
+        }
+    }
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            if read_book_meta(&dir).map(|book| book.id == id).unwrap_or(false) {
+                return Ok(dir);
+            }
+        }
+    }
+    Ok(root.join(id))
+}
+
+/// 启动迁移：根目录散装书 → 可读目录；旧目录名 → 规范目录名。
+/// 返回本次改动（移动/改名/合并）的数量，供书库自检展示。
+fn migrate_library_layout(app: &tauri::AppHandle) -> Result<usize, String> {
+    let root = books_root(app)?;
+    let mut changed = 0usize;
+
+    // ① 根目录散装正文文件 → <书名>__<短编号>/source.<ext>
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(fmt) = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .and_then(normalize_format)
+            else {
+                continue;
+            };
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if meta.len() == 0 {
+                continue;
+            }
+            let id = format!("flat_{}", simple_hash(&name));
+            let title = file_title(&path);
+            let title = if title.is_empty() { "未命名".to_string() } else { title };
+            let dir = unique_book_dir(&root, &title, &id);
+            fs::create_dir_all(&dir).map_err(|e| format!("无法创建书目目录：{e}"))?;
+            let target = dir.join(source_name_of(&fmt));
+            if !target.exists() {
+                move_path(&path, &target)?;
+                changed += 1;
+            }
+            let cover = find_cached_cover(&root, &sanitize_filename(&title));
+            let mut book = BookMeta {
+                id: id.clone(),
+                title,
+                format: fmt,
+                byte_len: meta.len(),
+                imported_at: meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_else(now_millis),
+                source_name: name,
+                cover,
+                storage: "library".into(),
+                path: None,
+                group: None,
+                last_opened_at: None,
+                dirname: dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string()),
+                source_fingerprint: None,
+            };
+            if !dir.join("meta.json").is_file() {
+                book.source_fingerprint = file_fingerprint(&target);
+                write_book_meta(&dir, &book)?;
+            }
+            // 旧模型的工作目录 <root>/<id> 并入新目录
+            merge_work_dir(&root.join(&id), &dir);
+        }
+    }
+
+    // ② 已有书目录改名到「书名__短编号」
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(mut book) = read_book_meta(&dir) else {
+                continue;
+            };
+            let target = unique_book_dir(&root, &book.title, &book.id);
+            let mut dir = dir;
+            if target != dir {
+                if fs::rename(&dir, &target).is_ok() {
+                    dir = target;
+                    changed += 1;
+                } else {
+                    continue;
+                }
+            }
+            let dirname = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            if book.dirname != dirname {
+                book.dirname = dirname;
+                write_book_meta(&dir, &book)?;
+            }
+        }
+    }
+
+    // ②b 没有 meta.json、但直接放着 source.<ext> 的旧式目录（如 <旧id>/source.epub）
+    // 说明旧版前端按「书库根 + 书 id」拼过路径；这里收养并改成可读目录。
+    let index = load_library_index(app);
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() || dir.join("meta.json").is_file() {
+                continue;
+            }
+            let dirname = entry.file_name().to_string_lossy().to_string();
+            let Some((source_file, fmt)) = [
+                "epub", "txt", "md", "html", "fb2", "mobi", "azw", "azw3", "cbz", "zip", "pdf",
+            ]
+            .iter()
+            .find_map(|ext| {
+                let path = dir.join(format!("source.{ext}"));
+                if path.is_file() {
+                    Some((path, ext.to_string()))
+                } else {
+                    None
+                }
+            })
+            else {
+                continue;
+            };
+            let id = if valid_id(&dirname) {
+                dirname.clone()
+            } else {
+                format!("flat_{}", simple_hash(&dirname))
+            };
+            let known = index.books.iter().find(|book| book.id == id);
+            let title = known
+                .map(|book| book.title.clone())
+                .unwrap_or_else(|| "未命名".to_string());
+            let source_name = known
+                .map(|book| book.source_name.clone())
+                .or_else(|| {
+                    source_file
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.to_string())
+                })
+                .unwrap_or_else(|| format!("source.{fmt}"));
+            // 改名后旧路径失效：先把大小与指纹取出来
+            let byte_len = fs::metadata(&source_file).map(|m| m.len()).unwrap_or(0);
+            let fingerprint = file_fingerprint(&source_file);
+            // 同一 id 已有正规书目录（迁移后旧版前端又写出的 flat_xxx）→ 并入，不另建副本
+            if let Ok(existing) = resolve_book_dir(app, &id) {
+                if existing != dir && read_book_meta(&existing).is_some() {
+                    merge_work_dir(&dir, &existing);
+                    changed += 1;
+                    continue;
+                }
+            }
+            let target = unique_book_dir(&root, &title, &id);
+            if target == dir || fs::rename(&dir, &target).is_err() {
+                continue;
+            }
+            let book = BookMeta {
+                id,
+                title,
+                format: fmt,
+                byte_len,
+                imported_at: now_millis(),
+                source_name,
+                cover: None,
+                storage: "library".into(),
+                path: None,
+                group: None,
+                last_opened_at: None,
+                dirname: target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string()),
+                source_fingerprint: fingerprint,
+            };
+            let _ = write_book_meta(&target, &book);
+            changed += 1;
+        }
+    }
+
+    // ③ 遗留工作目录（有 meta.json 却没有正文，通常是文件改名前生成的 flat_<hash>）
+    // 并入同名书目录，避免资源管理器里长期残留不可读目录。
+    let mut targets: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(book) = read_book_meta(&dir) else {
+                continue;
+            };
+            if source_in_dir(&dir, &book.format).is_some() {
+                targets.push((book.source_name.clone(), dir));
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(book) = read_book_meta(&dir) else {
+                continue;
+            };
+            if source_in_dir(&dir, &book.format).is_some() {
+                continue;
+            }
+            let Some((_, target)) = targets
+                .iter()
+                .find(|(name, path)| name == &book.source_name && path != &dir)
+            else {
+                continue;
+            };
+            let _ = fs::remove_file(dir.join("meta.json"));
+            merge_work_dir(&dir, target);
+            changed += 1;
+        }
+    }
+
+    // ④ 旧版壳文件（直接放在书目录根）迁入 阅读壳/，与 S6 读写路径一致。
+    // 不并入 changed：目录名没变，避免自检把「整理目录数」报大。
+    adopt_legacy_sidecars(&root);
+
+    Ok(changed)
 }
 
 fn now_millis() -> i64 {
@@ -417,6 +927,92 @@ fn book_source_path(app: &tauri::AppHandle, book: &BookMeta) -> Result<PathBuf, 
     let legacy = dir.join("source.txt");
     if legacy.exists() { return Ok(legacy); }
     Err("书库中找不到这本书的正文文件".into())
+}
+
+/// 把调用方传来的旧路径纠正到当前真实正文。
+/// 覆盖两类历史遗留：
+/// - `<书库>/<旧目录名>/source.<ext>`（目录名可能是迁移前的 id，如 `flat_xxx`）；
+/// - 迁移前直接摊在书库根目录的散装书。
+/// 找不到时原样返回，由调用方报错。
+fn resolve_existing_source(app: &tauri::AppHandle, raw: &str) -> PathBuf {
+    let direct = PathBuf::from(raw);
+    if direct.is_file() {
+        return direct;
+    }
+    let Ok(root) = books_root(app) else {
+        return direct;
+    };
+    if !direct.starts_with(&root) {
+        return direct;
+    }
+    // ① 父目录名当作书 id 解析（`<root>/flat_xxx/source.epub`）
+    if let Some(parent) = direct
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    {
+        if valid_id(parent) {
+            if let Ok(dir) = resolve_book_dir(app, parent) {
+                if let Some(book) = read_book_meta(&dir) {
+                    if let Some(src) = source_in_dir(&dir, &book.format) {
+                        return src;
+                    }
+                }
+            }
+        }
+    }
+    // ② 按原始文件名匹配 sourceName（迁移前根目录散装书）
+    if let Some(name) = direct.file_name().and_then(|n| n.to_str()) {
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                let Some(book) = read_book_meta(&dir) else {
+                    continue;
+                };
+                if book.source_name != name {
+                    continue;
+                }
+                if let Some(src) = source_in_dir(&dir, &book.format) {
+                    return src;
+                }
+            }
+        }
+    }
+    direct
+}
+
+/// 写入侧的路径防御：书库根下若按旧习惯用「书 id」当目录名
+/// （如 `<root>/flat_xxx/working.epub`），改指向这本书的真实目录，
+/// 避免迁移改名后旧调用方又在书库里造出 flat_<id> 目录。
+fn resolve_library_write_path(app: &tauri::AppHandle, raw: &Path) -> PathBuf {
+    let Ok(root) = books_root(app) else {
+        return raw.to_path_buf();
+    };
+    if !raw.starts_with(&root) {
+        return raw.to_path_buf();
+    }
+    let Some(parent) = raw.parent() else {
+        return raw.to_path_buf();
+    };
+    if parent == root || parent.join("meta.json").is_file() {
+        return raw.to_path_buf();
+    }
+    let Some(name) = parent.file_name().and_then(|n| n.to_str()) else {
+        return raw.to_path_buf();
+    };
+    if !valid_id(name) {
+        return raw.to_path_buf();
+    }
+    let Ok(dir) = resolve_book_dir(app, name) else {
+        return raw.to_path_buf();
+    };
+    if dir == parent || read_book_meta(&dir).is_none() {
+        return raw.to_path_buf();
+    }
+    match raw.file_name() {
+        Some(file) => dir.join(file),
+        None => raw.to_path_buf(),
+    }
 }
 
 /// 记录一次阅读历史（history 模式）。同一路径反复打开只更新时间。
@@ -523,11 +1119,11 @@ fn import_library(
     let stamp = now_millis();
     let mut id = stamp.to_string();
     let mut n = 1;
-    while root.join(&id).exists() {
+    while resolve_book_dir(app, &id).map(|d| d.exists()).unwrap_or(false) {
         id = format!("{stamp}-{n}");
         n += 1;
     }
-    let dir = root.join(&id);
+    let dir = unique_book_dir(&root, &title, &id);
     fs::create_dir_all(&dir).map_err(|e| format!("无法创建书目目录：{e}"))?;
     fs::write(dir.join(source_name_of(&ext)), &bytes)
         .map_err(|e| format!("写入副本失败：{e}"))?;
@@ -544,9 +1140,16 @@ fn import_library(
         path: None,
         group: group.filter(|value| !value.trim().is_empty()),
         last_opened_at: None,
+        dirname: dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string()),
+        source_fingerprint: Some(bytes_fingerprint(&bytes)),
     };
-    let json = serde_json::to_string_pretty(&book).map_err(|e| format!("序列化书目失败：{e}"))?;
-    fs::write(dir.join("meta.json"), json).map_err(|e| format!("写入书目失败：{e}"))?;
+    write_book_meta(&dir, &book)?;
+    let previous = load_library_index(app);
+    let index = rebuild_library_index(app, &previous);
+    let _ = save_library_index(app, &index);
     Ok(book)
 }
 
@@ -562,22 +1165,18 @@ fn list_library_books(app: &tauri::AppHandle) -> Vec<BookMeta> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // ① 旧模型：子文件夹 + meta.json
+        // ① 书目录模型：<书名>__<短编号>/meta.json + source.<ext>
         if path.is_dir() {
-            let Ok(text) = fs::read_to_string(path.join("meta.json")) else {
-                continue;
-            };
-            let Ok(mut book) = serde_json::from_str::<BookMeta>(&text) else {
+            let Some(mut book) = read_book_meta(&path) else {
                 continue;
             };
             book.storage = "library".into();
             book.path = None;
-            if book_source_path(app, &book)
-                .map(|p| p.exists())
-                .unwrap_or(false)
-            {
-                out.push(book);
+            book.dirname = Some(name);
+            if source_in_dir(&path, &book.format).is_none() {
+                continue;
             }
+            out.push(book);
             continue;
         }
 
@@ -613,6 +1212,8 @@ fn list_library_books(app: &tauri::AppHandle) -> Vec<BookMeta> {
                 path: Some(path.to_string_lossy().to_string()),
                 group: None,
                 last_opened_at: None,
+                dirname: None,
+                source_fingerprint: None,
             };
 
             // 封面：已有有效缓存就复用，缺失/损坏则从 EPUB 重新提取
@@ -746,6 +1347,157 @@ fn list_books(app: tauri::AppHandle) -> Result<Vec<BookMeta>, String> {
     Ok(out)
 }
 
+/// 书库自检报告：索引 ↔ 实际目录的差异汇总。
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct LibraryReport {
+    /// 本次检查的书目录数
+    scanned: usize,
+    /// 重建后索引里的书目数
+    books: usize,
+    /// 本次迁移修正的目录数（改名/移动）
+    renamed: usize,
+    /// 是否已重建并写回 library-index.json
+    index_rebuilt: bool,
+    /// 正文文件缺失的书名
+    missing_dirs: Vec<String>,
+    /// 目录存在但索引里没有登记的书目录名
+    unregistered: Vec<String>,
+    /// 书目 id 重复的书名
+    duplicates: Vec<String>,
+    /// 正文与上次检查不一致的书名
+    changed_sources: Vec<String>,
+    /// 没有 meta.json、直接用 <旧id> 当目录名的遗留目录（应恒为空）
+    legacy_dirs: Vec<String>,
+    /// 本次从书目录根迁入 `阅读壳/` 的旧壳文件数
+    sidecars_moved: usize,
+    /// 仍留在书目录根的旧壳文件（与新位置冲突或迁移失败，应恒为空）
+    legacy_sidecars: Vec<String>,
+    /// `阅读壳/` 里白名单之外的文件（命名漂移预警，应恒为空）
+    unknown_sidecars: Vec<String>,
+}
+
+/// 书库自检：先做命名迁移，再核对正文、重建索引。
+/// 单本失败只体现在报告里，不影响其他书。
+#[tauri::command]
+fn library_check(app: tauri::AppHandle) -> Result<LibraryReport, String> {
+    let root = books_root(&app)?;
+    let previous = load_library_index(&app);
+    // 先收养旧壳文件再迁移目录：报告里能说清本次搬了几份，目录改名也不影响。
+    let mut report = LibraryReport {
+        sidecars_moved: adopt_legacy_sidecars(&root),
+        ..Default::default()
+    };
+    report.renamed = migrate_library_layout(&app).unwrap_or(0);
+    let mut entries: Vec<LibraryIndexEntry> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let old_names: std::collections::HashSet<String> =
+        previous.books.iter().map(|item| item.dir_name.clone()).collect();
+
+    if let Ok(items) = fs::read_dir(&root) {
+        for item in items.flatten() {
+            let dir = item.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(book) = read_book_meta(&dir) else {
+                // 迁移后仍存在的旧式目录（无 meta.json 却直接放 source.<ext>）单独列出
+                if source_in_dir(&dir, "epub").is_some()
+                    || dir.join("source.txt").is_file()
+                    || dir.join("source.md").is_file()
+                    || dir.join("source.html").is_file()
+                {
+                    report
+                        .legacy_dirs
+                        .push(item.file_name().to_string_lossy().to_string());
+                }
+                continue;
+            };
+            report.scanned += 1;
+            let dir_name = item.file_name().to_string_lossy().to_string();
+            if !seen_ids.insert(book.id.clone()) {
+                report.duplicates.push(book.title.clone());
+                continue;
+            }
+            if !previous.books.is_empty() && !old_names.contains(&dir_name) {
+                report.unregistered.push(dir_name.clone());
+            }
+            let Some(source) = source_in_dir(&dir, &book.format) else {
+                report.missing_dirs.push(book.title.clone());
+                continue;
+            };
+            // 有壳数据就刷新清单：补母本指纹，同时把白名单外的文件记进报告。
+            let shell = book_sidecar_dir(&dir);
+            if shell.is_dir() {
+                let _ = refresh_sidecar_manifest(&dir, &book.id);
+                for name in sidecar_file_names() {
+                    if dir.join(format!("{name}.json")).is_file() {
+                        report
+                            .legacy_sidecars
+                            .push(format!("{dir_name}/{name}.json"));
+                    }
+                }
+                if let Ok(files) = fs::read_dir(&shell) {
+                    let known: Vec<String> = sidecar_file_names()
+                        .iter()
+                        .map(|name| format!("{name}.json"))
+                        .chain(std::iter::once(SIDECAR_MANIFEST_FILE.to_string()))
+                        .collect();
+                    for file in files.flatten() {
+                        let name = file.file_name().to_string_lossy().to_string();
+                        if file.path().is_file()
+                            && !known.contains(&name)
+                            && !name.ends_with(".tmp")
+                        {
+                            report
+                                .unknown_sidecars
+                                .push(format!("{dir_name}/{SIDECAR_DIR}/{name}"));
+                        }
+                    }
+                }
+            }
+            let now = file_fingerprint(&source);
+            let old = previous.books.iter().find(|entry| entry.id == book.id);
+            if let (Some(prev), Some(current)) = (
+                old.and_then(|entry| entry.source_fingerprint.as_deref()),
+                now.as_deref(),
+            ) {
+                if prev != current {
+                    report.changed_sources.push(book.title.clone());
+                }
+            }
+            entries.push(LibraryIndexEntry {
+                id: book.id.clone(),
+                dir_name,
+                title: book.title.clone(),
+                source_name: book.source_name.clone(),
+                source_fingerprint: now,
+                sidecar: has_sidecar_data(&dir),
+                translation: dir.join("forge-draft.json").is_file(),
+                last_checked_at: now_millis(),
+            });
+        }
+    }
+
+    // 索引里登记过、但目录已经消失的书
+    for old in previous.books.iter() {
+        if !seen_ids.contains(&old.id) && !report.missing_dirs.contains(&old.title) {
+            report.missing_dirs.push(old.title.clone());
+        }
+    }
+
+    entries.sort_by(|a, b| a.title.cmp(&b.title));
+    let index = LibraryIndex {
+        schema_version: library_index_version(),
+        updated_at: now_millis(),
+        books: entries,
+    };
+    report.books = index.books.len();
+    save_library_index(&app, &index)?;
+    report.index_rebuilt = true;
+    Ok(report)
+}
+
 /// 读取某本书的原始字节（书库副本或历史原文件）。
 #[tauri::command]
 fn read_book_bytes(app: tauri::AppHandle, id: String) -> Result<tauri::ipc::Response, String> {
@@ -753,6 +1505,325 @@ fn read_book_bytes(app: tauri::AppHandle, id: String) -> Result<tauri::ipc::Resp
     let path = book_source_path(&app, &book)?;
     let bytes = fs::read(&path).map_err(|e| format!("读取书目失败：{e}"))?;
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// 一本书的真实落盘位置。前端必须用它，不能再用「书库根 + 书 id + source.epub」拼路径。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BookPaths {
+    /// 正文文件绝对路径（source.epub / source.txt …）
+    source: String,
+    /// 书目录绝对路径（阅读壳、forge_edit、revisions 都在这里）
+    dir: String,
+}
+
+#[tauri::command]
+fn book_paths(app: tauri::AppHandle, id: String) -> Result<BookPaths, String> {
+    let book = find_book(&app, &id).ok_or_else(|| "书架上找不到这条书目".to_string())?;
+    let source = book_source_path(&app, &book)?;
+    let dir = if book.storage == "library" {
+        book_dir(&app, &id)?
+    } else {
+        source.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+    };
+    Ok(BookPaths {
+        source: source.to_string_lossy().to_string(),
+        dir: dir.to_string_lossy().to_string(),
+    })
+}
+
+// ─── S6：阅读壳（sidecar） ───
+//
+// 阅读档产生的数据（高亮/笔记、划词译文、阅读设置快照）统一放在书目录下的
+// `阅读壳/`，与母本同层；复制或移动整个书目录即可整体带走。
+// 文件名固定为 <name>.json，**不使用书名**：书目录本身已经承载可读书名，
+// 书名再改也不会把壳文件引用打断（W38「改名后路径失效」的同类坑）。
+// `manifest.json` 记录 schemaVersion、母本指纹与各文件时间戳，供自检与迁移。
+
+const SIDECAR_DIR: &str = "阅读壳";
+const SIDECAR_MANIFEST_FILE: &str = "manifest.json";
+
+fn sidecar_schema_version() -> u32 {
+    1
+}
+
+/// 允许读写的壳文件名白名单：固定名，同时挡住路径穿越与命名漂移。
+/// history 存最近若干次标注/译文操作快照，重启后仍可撤销。
+fn sidecar_file_names() -> [&'static str; 4] {
+    ["annotations", "translate-drafts", "reading", "history"]
+}
+
+fn is_sidecar_name(name: &str) -> bool {
+    sidecar_file_names().contains(&name)
+}
+
+fn book_sidecar_dir(dir: &Path) -> PathBuf {
+    dir.join(SIDECAR_DIR)
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SidecarFileStamp {
+    #[serde(default)]
+    updated_at: i64,
+    #[serde(default)]
+    bytes: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SidecarManifest {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    book_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    source_name: String,
+    #[serde(default)]
+    source_fingerprint: Option<String>,
+    #[serde(default)]
+    source_size: u64,
+    #[serde(default)]
+    source_mtime_ms: i64,
+    #[serde(default)]
+    updated_at: i64,
+    #[serde(default)]
+    files: std::collections::BTreeMap<String, SidecarFileStamp>,
+}
+
+fn file_mtime_ms(path: &Path) -> i64 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 原子写：先写 .tmp 再替换，断电/崩溃不会留下半截 JSON。
+fn atomic_write_text(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text).map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("替换 {} 失败：{e}", path.display())
+    })
+}
+
+/// 刷新阅读壳清单；母本大小与修改时间都没变时沿用旧指纹，避免每次写标注都全量读母本。
+fn refresh_sidecar_manifest(dir: &Path, id: &str) -> Result<(), String> {
+    let Some(book) = read_book_meta(dir) else {
+        return Ok(());
+    };
+    let shell = book_sidecar_dir(dir);
+    fs::create_dir_all(&shell).map_err(|e| format!("无法创建阅读壳目录：{e}"))?;
+    let source = source_in_dir(dir, &book.format);
+    let source_size = source
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let source_mtime_ms = source
+        .as_ref()
+        .map(|path| file_mtime_ms(path))
+        .unwrap_or(0);
+    let previous: Option<SidecarManifest> =
+        fs::read_to_string(shell.join(SIDECAR_MANIFEST_FILE))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+    let fingerprint = match (&previous, source.as_ref()) {
+        (Some(prev), Some(_))
+            if prev.source_fingerprint.is_some()
+                && prev.source_size == source_size
+                && prev.source_mtime_ms == source_mtime_ms =>
+        {
+            prev.source_fingerprint.clone()
+        }
+        (_, Some(path)) => file_fingerprint(path),
+        _ => None,
+    };
+    let mut files = std::collections::BTreeMap::new();
+    for name in sidecar_file_names() {
+        let file = shell.join(format!("{name}.json"));
+        if let Ok(meta) = fs::metadata(&file) {
+            files.insert(
+                name.to_string(),
+                SidecarFileStamp {
+                    updated_at: file_mtime_ms(&file),
+                    bytes: meta.len(),
+                },
+            );
+        }
+    }
+    let manifest = SidecarManifest {
+        schema_version: sidecar_schema_version(),
+        book_id: id.to_string(),
+        title: book.title,
+        source_name: book.source_name,
+        source_fingerprint: fingerprint,
+        source_size,
+        source_mtime_ms,
+        updated_at: now_millis(),
+        files,
+    };
+    let json =
+        serde_json::to_string_pretty(&manifest).map_err(|e| format!("序列化阅读壳清单失败：{e}"))?;
+    atomic_write_text(&shell.join(SIDECAR_MANIFEST_FILE), &json)
+}
+
+/// 给壳文件盖上 schemaVersion / bookId / 母本指纹 / updatedAt，文件自己就能说明来路。
+fn stamped_sidecar_json(json: &str, id: &str, fingerprint: Option<&str>) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("阅读壳内容不是合法 JSON：{e}"))?;
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(json.to_string());
+    };
+    obj.insert(
+        "schemaVersion".into(),
+        serde_json::json!(sidecar_schema_version()),
+    );
+    obj.insert("bookId".into(), serde_json::json!(id));
+    if let Some(fp) = fingerprint {
+        obj.insert("sourceFingerprint".into(), serde_json::json!(fp));
+    }
+    obj.insert("updatedAt".into(), serde_json::json!(now_millis()));
+    serde_json::to_string_pretty(&value).map_err(|e| format!("序列化阅读壳失败：{e}"))
+}
+
+fn has_sidecar_data(dir: &Path) -> bool {
+    let shell = book_sidecar_dir(dir);
+    sidecar_file_names()
+        .iter()
+        .any(|name| shell.join(format!("{name}.json")).is_file())
+}
+
+/// 旧版把壳文件直接放在书目录根：迁入 `阅读壳/`，迁不动的留给自检报告。
+fn adopt_legacy_sidecars(root: &Path) -> usize {
+    let mut moved = 0usize;
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() || read_book_meta(&dir).is_none() {
+            continue;
+        }
+        let shell = book_sidecar_dir(&dir);
+        for name in sidecar_file_names() {
+            let from = dir.join(format!("{name}.json"));
+            if !from.is_file() {
+                continue;
+            }
+            let to = shell.join(format!("{name}.json"));
+            if to.exists() {
+                continue;
+            }
+            if fs::create_dir_all(&shell).is_err() {
+                continue;
+            }
+            if fs::rename(&from, &to).is_ok() {
+                moved += 1;
+            }
+        }
+    }
+    moved
+}
+
+#[tauri::command]
+fn read_sidecar(app: tauri::AppHandle, id: String, name: String) -> Result<String, String> {
+    if !is_sidecar_name(&name) {
+        return Err(format!("未知的阅读壳文件：{name}"));
+    }
+    let dir = book_dir(&app, &id)?;
+    let path = book_sidecar_dir(&dir).join(format!("{name}.json"));
+    if path.is_file() {
+        return fs::read_to_string(&path).map_err(|e| format!("读取阅读壳失败：{e}"));
+    }
+    // 旧位置有就顺手迁入，升级后第一次打开书不丢标注。
+    let legacy = dir.join(format!("{name}.json"));
+    if legacy.is_file() {
+        let text = fs::read_to_string(&legacy).map_err(|e| format!("读取旧壳文件失败：{e}"))?;
+        fs::create_dir_all(book_sidecar_dir(&dir))
+            .map_err(|e| format!("无法创建阅读壳目录：{e}"))?;
+        atomic_write_text(&path, &text)?;
+        let _ = fs::remove_file(&legacy);
+        let _ = refresh_sidecar_manifest(&dir, &id);
+        return Ok(text);
+    }
+    Ok(String::new())
+}
+
+#[tauri::command]
+fn write_sidecar(
+    app: tauri::AppHandle,
+    id: String,
+    name: String,
+    json: String,
+) -> Result<(), String> {
+    if !is_sidecar_name(&name) {
+        return Err(format!("未知的阅读壳文件：{name}"));
+    }
+    let dir = book_dir(&app, &id)?;
+    let shell = book_sidecar_dir(&dir);
+    fs::create_dir_all(&shell).map_err(|e| format!("无法创建阅读壳目录：{e}"))?;
+    // 先刷新清拿到当前母本指纹，再盖章写文件，最后刷新一次文件时间戳。
+    refresh_sidecar_manifest(&dir, &id)?;
+    let fingerprint = fs::read_to_string(shell.join(SIDECAR_MANIFEST_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<SidecarManifest>(&text).ok())
+        .and_then(|manifest| manifest.source_fingerprint);
+    let stamped = stamped_sidecar_json(&json, &id, fingerprint.as_deref())?;
+    atomic_write_text(&shell.join(format!("{name}.json")), &stamped)?;
+    refresh_sidecar_manifest(&dir, &id)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SidecarInfo {
+    dir: String,
+    exists: bool,
+    manifest: Option<SidecarManifest>,
+    /// 还留在书目录根的旧壳文件（应恒为空）
+    legacy_files: Vec<String>,
+    /// `阅读壳/` 里白名单之外的文件（命名漂移的预警）
+    unknown_files: Vec<String>,
+}
+
+#[tauri::command]
+fn sidecar_info(app: tauri::AppHandle, id: String) -> Result<SidecarInfo, String> {
+    let dir = book_dir(&app, &id)?;
+    let shell = book_sidecar_dir(&dir);
+    let manifest = fs::read_to_string(shell.join(SIDECAR_MANIFEST_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<SidecarManifest>(&text).ok());
+    let legacy_files = sidecar_file_names()
+        .iter()
+        .map(|name| format!("{name}.json"))
+        .filter(|file| dir.join(file).is_file())
+        .collect();
+    let mut known: Vec<String> = sidecar_file_names()
+        .iter()
+        .map(|name| format!("{name}.json"))
+        .collect();
+    known.push(SIDECAR_MANIFEST_FILE.to_string());
+    let mut unknown_files = Vec::new();
+    if let Ok(entries) = fs::read_dir(&shell) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.path().is_file() && !known.contains(&name) && !name.ends_with(".tmp") {
+                unknown_files.push(name);
+            }
+        }
+    }
+    Ok(SidecarInfo {
+        dir: shell.to_string_lossy().to_string(),
+        exists: shell.is_dir(),
+        manifest,
+        legacy_files,
+        unknown_files,
+    })
 }
 
 /// 递归扫描文件夹，供导入弹窗一次列出所有可导入文件。
@@ -964,26 +2035,25 @@ fn save_cover(app: tauri::AppHandle, id: String, base64: String, ext: String) ->
     let dir = cover_dir(&app, &id)?;
     let book = find_book(&app, &id);
     let is_history = find_history_entry(&app, &id).is_some();
-    let flat = !is_history
-        && book
-            .as_ref()
-            .and_then(|b| b.path.as_deref())
-            .map(|p| Path::new(p).is_file())
-            .unwrap_or(false);
-    let name = if flat {
+    // 书库统一用「书名.ext」命名（与 covers/ 自动提取的缓存同名，避免同名书互相覆盖）
+    let name = if is_history {
+        format!("cover.{real_ext}")
+    } else {
         format!(
             "{}.{}",
             sanitize_filename(book.as_ref().map(|b| b.title.as_str()).unwrap_or("")),
             real_ext
         )
-    } else {
-        format!("cover.{real_ext}")
     };
     fs::write(dir.join(&name), &bytes).map_err(|e| format!("写入封面失败：{e}"))?;
-    if flat {
-        return Ok(());
+    // 书目录模型才有 meta.json；旧扁平文件（迁移前）不登记
+    let has_meta = book_dir(&app, &id)
+        .map(|dir| dir.join("meta.json").is_file())
+        .unwrap_or(false);
+    if has_meta {
+        write_cover_meta(&app, &id, &name)?;
     }
-    write_cover_meta(&app, &id, &name)
+    Ok(())
 }
 
 /// 读取书目封面原始字节（没有封面时返回空响应）。
@@ -1103,18 +2173,14 @@ fn shelf_health(app: tauri::AppHandle) -> Result<ShelfHealthReport, String> {
     let covers = root.join("covers");
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // ① 扁平书库：正文存在性 + 封面修复
+    // ① 书库：正文存在性 + 封面修复（目录模型与旧扁平文件统一走 book_source_path）
     for book in list_library_books(&app) {
         report.scanned += 1;
-        let source = book.path.as_ref().map(PathBuf::from);
-        if !source.as_ref().map(|p| p.is_file()).unwrap_or(false)
-            && book_source_path(&app, &book).is_err()
-        {
+        let Some(source) = book_source_path(&app, &book)
+            .ok()
+            .filter(|path| path.is_file())
+        else {
             report.missing_sources.push(book.title.clone());
-            continue;
-        }
-        // 旧子文件夹模型的封面放在书目录里，这里只管扁平模型
-        let Some(source) = source.filter(|p| p.is_file()) else {
             continue;
         };
         if book.format != "epub" {
@@ -1201,9 +2267,9 @@ fn shelf_health(app: tauri::AppHandle) -> Result<ShelfHealthReport, String> {
 /// 把前端生成的 EPUB 二进制写入用户选定路径。
 /// 前端用 base64 传输：Tauri 对 Vec<u8> 会走 JSON 数字数组，几 MB 的书会膨胀数倍。
 #[tauri::command]
-fn save_epub(path: String, base64: String) -> Result<u64, String> {
+fn save_epub(app: tauri::AppHandle, path: String, base64: String) -> Result<u64, String> {
     use base64::Engine as _;
-    let target = PathBuf::from(&path);
+    let target = resolve_library_write_path(&app, &PathBuf::from(&path));
     let ext = target
         .extension()
         .and_then(|e| e.to_str())
@@ -1254,6 +2320,14 @@ struct RevisionMeta {
     label: String,
     source_bytes: u64,
     note: String,
+    /// 快照来源：forge（锻造/文本写回）或 edit（EPUB 编辑器保存）。
+    /// 共用同一个 revisions 目录，两个面板按来源过滤，避免互相回滚错文件。
+    #[serde(default = "revision_kind_forge")]
+    kind: String,
+}
+
+fn revision_kind_forge() -> String {
+    "forge".into()
 }
 
 /// 版本目录：<书目>/revisions/，不存在时创建。
@@ -1342,7 +2416,10 @@ fn list_revisions(app: tauri::AppHandle, id: String) -> Result<Vec<RevisionMeta>
             continue;
         };
         if let Ok(meta) = serde_json::from_str::<RevisionMeta>(&text) {
-            out.push(meta);
+            // 编辑器快照走 edit_save 写入，这里只列锻造自己的历史
+            if meta.kind != "edit" {
+                out.push(meta);
+            }
         }
     }
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -1392,6 +2469,7 @@ fn commit_forge(
         label: label.chars().take(60).collect(),
         source_bytes,
         note: note.chars().take(200).collect(),
+        kind: "forge".into(),
     };
     write_revision_meta(&rev_dir, &meta)?;
     prune_revisions(&rev_dir, 30)?;
@@ -1435,6 +2513,7 @@ fn restore_revision(app: tauri::AppHandle, id: String, rev: String) -> Result<Re
         label: "回滚前自动存档".into(),
         source_bytes: bytes,
         note: format!("回滚到版本 {rev} 之前的状态"),
+        kind: "forge".into(),
     };
     write_revision_meta(&rev_dir, &meta)?;
 
@@ -1479,9 +2558,8 @@ fn normalize_endpoint(raw: &str) -> String {
     raw.trim().trim_end_matches('/').to_string()
 }
 
-/// 调用一次翻译接口。失败时返回中文可读原因，前端据此决定是否降级到本地。
-#[tauri::command]
-fn translate_text(req: TranslateRequest) -> Result<TranslateReply, String> {
+/// 同步执行一次翻译请求；只允许在阻塞线程池里跑，避免卡住 UI 主线程。
+fn translate_blocking(req: TranslateRequest) -> Result<TranslateReply, String> {
     let started = Instant::now();
     let endpoint = normalize_endpoint(&req.endpoint);
     if endpoint.is_empty() {
@@ -1524,7 +2602,17 @@ fn translate_text(req: TranslateRequest) -> Result<TranslateReply, String> {
                 _ => format!("翻译接口返回 {code}：{detail}"),
             }
         }
-        ureq::Error::Transport(t) => format!("连接翻译接口失败：{t}"),
+        ureq::Error::Transport(t) => {
+            // 本机地址多半是引擎没启动，直接把地址和处置办法写进错误里
+            let is_local = endpoint.contains("127.0.0.1") || endpoint.contains("localhost");
+            if is_local {
+                format!(
+                    "连不上本地翻译引擎 {url}：{t}。请确认 Ollama / LM Studio 已启动，或在设置里改到可用地址"
+                )
+            } else {
+                format!("连接翻译接口失败（{url}）：{t}")
+            }
+        }
     })?;
 
     let value: serde_json::Value = response
@@ -1542,6 +2630,224 @@ fn translate_text(req: TranslateRequest) -> Result<TranslateReply, String> {
         url,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// 调用一次翻译接口。失败时返回中文可读原因，前端据此决定是否降级到本地。
+/// 异步命令 + spawn_blocking：网络等待不占用主线程，窗口不会因此“未响应”。
+#[tauri::command]
+async fn translate_text(req: TranslateRequest) -> Result<TranslateReply, String> {
+    tauri::async_runtime::spawn_blocking(move || translate_blocking(req))
+        .await
+        .map_err(|e| format!("翻译任务执行失败：{e}"))?
+}
+
+// ───────────────────────── 百度翻译（通用文本翻译） ─────────────────────────
+
+/// 百度通用文本翻译请求：APP ID + 密钥签名，与 OpenAI 协议不兼容，单独一条命令。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BaiduTranslateRequest {
+    app_id: String,
+    key: String,
+    q: String,
+    from: String,
+    to: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BaiduTranslateReply {
+    text: String,
+    /// 按输入行拆分的译文，供整章批量翻译逐段回填
+    items: Vec<String>,
+    from: String,
+    to: String,
+    elapsed_ms: u64,
+}
+
+fn baidu_error(code: &str, msg: &str) -> String {
+    let hint = match code {
+        "52001" => "请求超时，请稍后重试",
+        "52002" => "百度服务系统错误，请稍后重试",
+        "52003" => "APP ID 未授权：请确认 APP ID 正确，且已开通对应翻译服务",
+        "53001" => "请求参数错误（常见原因：salt 不是数字、q 为空或超长）",
+        "53002" => "当前服务未开通：请到控制台开通「大模型文本翻译」",
+        "54000" => "必填参数为空",
+        "54001" => "签名错误：请检查密钥是否复制完整",
+        "54003" => "访问频率受限：请降低频率后重试（通用版 QPS=1，大模型版 QPS=10）",
+        "54004" => "账户余额不足：免费额度可能已用完",
+        "54005" => "长 query 请求频繁：请缩短段落或降低频率",
+        "58000" => "客户端 IP 非法：请检查网络环境",
+        "58001" => "译文语言方向不支持",
+        "58002" => "服务当前已关闭：请到控制台确认服务已开通",
+        "90107" => "认证未通过或未生效，请稍后重试",
+        _ => "百度翻译返回错误",
+    };
+    format!("百度翻译错误 {code}：{hint}（{msg}）")
+}
+
+fn baidu_translate_blocking(req: BaiduTranslateRequest) -> Result<BaiduTranslateReply, String> {
+    let started = Instant::now();
+    let app_id = req.app_id.trim();
+    let key = req.key.trim();
+    if app_id.is_empty() || key.is_empty() {
+        return Err("还没有填写百度翻译的 APP ID 或密钥".into());
+    }
+    let q = req.q.trim();
+    if q.is_empty() {
+        return Err("没有需要翻译的原文".into());
+    }
+    if q.len() > 6000 {
+        return Err("这段原文超过百度单次 6000 字节上限，请先拆分段落".into());
+    }
+    let salt = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let sign = format!("{:x}", md5::compute(format!("{app_id}{q}{salt}{key}")));
+    let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(30_000).clamp(5_000, 120_000));
+
+    let response = ureq::post("https://fanyi-api.baidu.com/api/trans/vip/translate")
+        .timeout(timeout)
+        .send_form(&[
+            ("q", q),
+            ("from", req.from.trim()),
+            ("to", req.to.trim()),
+            ("appid", app_id),
+            ("salt", &salt.to_string()),
+            ("sign", &sign),
+        ])
+        .map_err(|err| match err {
+            ureq::Error::Status(code, resp) => {
+                let detail: String = resp.into_string().unwrap_or_default().chars().take(300).collect();
+                format!("百度翻译接口返回 {code}：{detail}")
+            }
+            ureq::Error::Transport(t) => format!("连接百度翻译失败：{t}"),
+        })?;
+
+    let value: serde_json::Value = response
+        .into_json()
+        .map_err(|e| format!("百度翻译返回的不是合法 JSON：{e}"))?;
+    parse_baidu_value(value, started)
+}
+
+/// 两个百度接口（通用 / 大模型）返回结构一致，解析逻辑共用。
+/// 通用版的 error_code 是字符串，大模型版实测返回数字，两种都要认。
+fn parse_baidu_value(value: serde_json::Value, started: Instant) -> Result<BaiduTranslateReply, String> {
+    let code = match value.get("error_code") {
+        Some(serde_json::Value::String(code)) => Some(code.clone()),
+        Some(serde_json::Value::Number(code)) => Some(code.to_string()),
+        _ => None,
+    };
+    if let Some(code) = code {
+        let msg = value.get("error_msg").and_then(|v| v.as_str()).unwrap_or("");
+        return Err(baidu_error(&code, msg));
+    }
+    let items: Vec<String> = value
+        .get("trans_result")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| item.get("dst").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = items.join("\n");
+    if text.trim().is_empty() {
+        return Err("百度翻译没有返回译文".into());
+    }
+    Ok(BaiduTranslateReply {
+        text,
+        items,
+        from: value.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        to: value.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+#[tauri::command]
+async fn baidu_translate(req: BaiduTranslateRequest) -> Result<BaiduTranslateReply, String> {
+    tauri::async_runtime::spawn_blocking(move || baidu_translate_blocking(req))
+        .await
+        .map_err(|e| format!("百度翻译任务执行失败：{e}"))?
+}
+
+/// 百度「大模型文本翻译」：与通用版共用 APP ID + 密钥签名，额外支持翻译指令。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BaiduLlmTranslateRequest {
+    app_id: String,
+    key: String,
+    q: String,
+    from: String,
+    to: String,
+    /// 自定义翻译指令（风格、语气、术语要求）
+    #[serde(default)]
+    reference: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+fn baidu_llm_translate_blocking(req: BaiduLlmTranslateRequest) -> Result<BaiduTranslateReply, String> {
+    let started = Instant::now();
+    let app_id = req.app_id.trim();
+    let key = req.key.trim();
+    if app_id.is_empty() || key.is_empty() {
+        return Err("还没有填写百度翻译的 APP ID 或密钥".into());
+    }
+    let q = req.q.trim();
+    if q.is_empty() {
+        return Err("没有需要翻译的原文".into());
+    }
+    if q.chars().count() > 6000 {
+        return Err("这段原文超过百度大模型接口单次 6000 字符上限，请先拆分段落".into());
+    }
+    // 大模型接口的 salt 必须是数字（传字符串会报 53001 parse json body error）
+    let salt = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let sign = format!("{:x}", md5::compute(format!("{app_id}{q}{salt}{key}")));
+    let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(60_000).clamp(5_000, 180_000));
+
+    let mut payload = serde_json::json!({
+        "appid": app_id,
+        "q": q,
+        "from": req.from.trim(),
+        "to": req.to.trim(),
+        "salt": salt,
+        "sign": sign,
+        "model_type": "llm",
+    });
+    if let Some(reference) = req.reference.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        payload["reference"] = serde_json::Value::String(reference.to_string());
+    }
+
+    let response = ureq::post("https://fanyi-api.baidu.com/ait/api/aiTextTranslate")
+        .set("Content-Type", "application/json")
+        .timeout(timeout)
+        .send_string(&payload.to_string())
+        .map_err(|err| match err {
+            ureq::Error::Status(code, resp) => {
+                let detail: String = resp.into_string().unwrap_or_default().chars().take(300).collect();
+                format!("百度大模型翻译接口返回 {code}：{detail}")
+            }
+            ureq::Error::Transport(t) => format!("连接百度大模型翻译失败：{t}"),
+        })?;
+
+    let value: serde_json::Value = response
+        .into_json()
+        .map_err(|e| format!("百度大模型翻译返回的不是合法 JSON：{e}"))?;
+    parse_baidu_value(value, started)
+}
+
+#[tauri::command]
+async fn baidu_llm_translate(req: BaiduLlmTranslateRequest) -> Result<BaiduTranslateReply, String> {
+    tauri::async_runtime::spawn_blocking(move || baidu_llm_translate_blocking(req))
+        .await
+        .map_err(|e| format!("百度大模型翻译任务执行失败：{e}"))?
 }
 
 /// 术语表与翻译记忆都放在应用数据目录的 translate/ 下，跨书共用。
@@ -1579,6 +2885,86 @@ fn read_translation_memory(app: tauri::AppHandle) -> Result<String, String> {
 fn write_translation_memory(app: tauri::AppHandle, json: String) -> Result<(), String> {
     let path = translate_dir(&app)?.join("memory.json");
     fs::write(&path, json).map_err(|e| format!("保存翻译记忆失败：{e}"))
+}
+
+// ─── P3：书级译文草稿已归入阅读壳（S6），读写统一走 read_sidecar/write_sidecar ───
+
+/// 锻造译文草稿：与原文结构一一对应的空占位文件，翻译只写 target，原文件不动。
+#[tauri::command]
+fn read_forge_draft(app: tauri::AppHandle, id: String) -> Result<String, String> {
+    let path = book_dir(&app, &id)?.join("forge-draft.json");
+    read_optional_text(&path)
+}
+
+#[tauri::command]
+fn write_forge_draft(app: tauri::AppHandle, id: String, json: String) -> Result<(), String> {
+    let dir = book_dir(&app, &id)?;
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建书目目录：{e}"))?;
+    fs::write(dir.join("forge-draft.json"), json)
+        .map_err(|e| format!("保存锻造草稿失败：{e}"))
+}
+
+/// 只写注释覆盖层；译文本身走译文工程，母本一个字节都不动。
+#[tauri::command]
+fn write_forge_state(app: tauri::AppHandle, id: String, forge: String) -> Result<(), String> {
+    let dir = book_dir(&app, &id)?;
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建书目目录：{e}"))?;
+    fs::write(dir.join("forge.json"), forge).map_err(|e| format!("保存锻造记录失败：{e}"))
+}
+
+/// S10：保存译文工程（`译文/<语言>/`）。不写母本、不建 revision。
+#[tauri::command]
+fn translation_save(
+    app: tauri::AppHandle,
+    id: String,
+    language: String,
+    chapters: Vec<translate_project::TranslationChapterInput>,
+) -> Result<translate_project::TranslationSaveResult, String> {
+    let book = find_book(&app, &id).ok_or_else(|| "书架上找不到这条书目".to_string())?;
+    if book.storage != "library" {
+        return Err("只有书库中的书可以保存译文工程".into());
+    }
+    let dir = book_dir(&app, &id)?;
+    let source = book_source_path(&app, &book)?;
+    let source_name = source
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("source")
+        .to_string();
+    let fingerprint = file_fingerprint(&source);
+    translate_project::save_project(translate_project::SaveArgs {
+        book_dir: &dir,
+        source: &source,
+        source_name,
+        source_fingerprint: fingerprint,
+        book_id: &book.id,
+        book_title: &book.title,
+        language: &language,
+        chapters,
+    })
+}
+
+/// S10：导出译文 EPUB 到设置里的 `final export`，不改动译文工程。
+#[tauri::command]
+fn translation_export(
+    app: tauri::AppHandle,
+    id: String,
+    language: String,
+) -> Result<translate_project::TranslationExportResult, String> {
+    let book = find_book(&app, &id).ok_or_else(|| "书架上找不到这条书目".to_string())?;
+    if book.storage != "library" {
+        return Err("只有书库中的书可以导出译文".into());
+    }
+    let dir = book_dir(&app, &id)?;
+    let source = book_source_path(&app, &book)?;
+    let output_dir = PathBuf::from(load_settings(&app).final_export_dir);
+    translate_project::export_project(translate_project::ExportArgs {
+        book_dir: &dir,
+        source: &source,
+        book_title: &book.title,
+        language: &language,
+        output_dir: &output_dir,
+    })
 }
 
 /// 术语表导入导出用的通用文本读写；只给本地用户操作，不暴露网络。
@@ -1820,8 +3206,13 @@ fn make_edit_dir(origin_path: String) -> Result<String, String> {
 
 /// 打开 EPUB（书库内或磁盘任意路径）→ 解包 → 返回工作副本信息与文件树
 #[tauri::command]
-fn edit_open_epub(epub_path: String, edit_dir: String) -> Result<EditWorkspace, String> {
-    let src = PathBuf::from(&epub_path);
+fn edit_open_epub(
+    app: tauri::AppHandle,
+    epub_path: String,
+    edit_dir: String,
+) -> Result<EditWorkspace, String> {
+    // 书库改名后旧路径可能还留在调用方，这里自动纠正到当前正文
+    let src = resolve_existing_source(&app, &epub_path);
     if !src.exists() {
         return Err(format!("源文件不存在: {}", epub_path));
     }
@@ -1956,18 +3347,47 @@ fn edit_write_file(edit_dir: String, rel_path: String, content: String) -> Resul
 
 /// 保存 = 先快照旧包 → 从工作副本重打包 → 原子替换 / 另存为
 #[tauri::command]
-fn edit_save(edit_dir: String, output_path: String, create_revision: bool) -> Result<(), String> {
+fn edit_save(
+    app: tauri::AppHandle,
+    edit_dir: String,
+    output_path: String,
+    create_revision: bool,
+    book_id: Option<String>,
+) -> Result<(), String> {
     let edit_path = PathBuf::from(&edit_dir);
     let out = PathBuf::from(&output_path);
 
     // 快照旧包（如果是覆盖保存且目标存在）
     if create_revision && out.exists() {
-        let rev_dir = edit_path.parent().unwrap().join("revisions");
-        fs::create_dir_all(&rev_dir).ok();
-        let ts = chrono_now_str();
-        let rev_name = format!("{}_{}.source", ts, out.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
-        let rev_path = rev_dir.join(&rev_name);
-        fs::copy(&out, &rev_path).map_err(|e| format!("快照失败: {}", e))?;
+        let stem = out
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if let Some(id) = book_id.as_deref().filter(|v| valid_id(v)) {
+            // P3：编辑器快照与锻造写回共用书级 revisions 目录，历史只有一处
+            let rev_dir = revisions_dir(&app, id)?;
+            let rev = unique_revision_id(&rev_dir);
+            let bytes = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            let snapshot = rev_dir.join(format!("{rev}.source"));
+            fs::copy(&out, &snapshot).map_err(|e| format!("快照失败: {}", e))?;
+            let meta = RevisionMeta {
+                id: rev,
+                created_at: now_millis(),
+                label: "编辑器保存".into(),
+                source_bytes: bytes,
+                note: stem,
+                kind: "edit".into(),
+            };
+            write_revision_meta(&rev_dir, &meta)?;
+            prune_revisions(&rev_dir, 30)?;
+        } else {
+            let rev_dir = edit_path.parent().unwrap().join("revisions");
+            fs::create_dir_all(&rev_dir).ok();
+            let ts = chrono_now_str();
+            let rev_name = format!("{}_{}.source", ts, stem);
+            let rev_path = rev_dir.join(&rev_name);
+            fs::copy(&out, &rev_path).map_err(|e| format!("快照失败: {}", e))?;
+        }
     }
 
     // 重打包
@@ -2059,6 +3479,40 @@ fn edit_rename_file(
     ee::rename_file(&edit_path, &opf_path, &from_path, &to_path)
 }
 
+/// S9：文件级操作影响面（manifest / spine / 目录 / 书内链接）
+#[tauri::command]
+fn edit_file_impact(
+    edit_dir: String,
+    opf_path: String,
+    rel_path: String,
+) -> Result<ee::FileImpact, String> {
+    let edit_path = PathBuf::from(&edit_dir);
+    ee::file_impact(&edit_path, &opf_path, &rel_path)
+}
+
+/// S9：新建章节（写模板并注册到 manifest / spine / nav / ncx）
+#[tauri::command]
+fn edit_create_chapter(
+    edit_dir: String,
+    opf_path: String,
+    rel_path: String,
+    title: String,
+) -> Result<ee::FileOpResult, String> {
+    let edit_path = PathBuf::from(&edit_dir);
+    ee::create_chapter(&edit_path, &opf_path, &rel_path, &title)
+}
+
+/// S9：删除文件（同步 manifest / spine / nav / ncx，并清掉书内指向它的链接）
+#[tauri::command]
+fn edit_delete_file(
+    edit_dir: String,
+    opf_path: String,
+    rel_path: String,
+) -> Result<ee::FileOpResult, String> {
+    let edit_path = PathBuf::from(&edit_dir);
+    ee::delete_file(&edit_path, &opf_path, &rel_path)
+}
+
 /// E3：全书扫描（未使用图片 / 孤儿文件 / 重复 id / 断链 / 目录与 spine 不一致）
 #[tauri::command]
 fn edit_scan_report(edit_dir: String, opf_path: String) -> Result<ee::ScanReport, String> {
@@ -2088,9 +3542,14 @@ fn edit_revisions_dir(edit_path: &Path) -> PathBuf {
 
 /// 列出工作副本旁边的历史快照（最新的在前）
 #[tauri::command]
-fn edit_list_revisions(edit_dir: String) -> Result<Vec<EpubRevision>, String> {
+fn edit_list_revisions(
+    app: tauri::AppHandle,
+    edit_dir: String,
+    book_id: Option<String>,
+) -> Result<Vec<EpubRevision>, String> {
     let edit_path = PathBuf::from(&edit_dir);
-    let dir = edit_revisions_dir(&edit_path);
+    let shared = book_id.as_deref().filter(|v| valid_id(v)).map(|id| revisions_dir(&app, id)).transpose()?;
+    let dir = shared.clone().unwrap_or_else(|| edit_revisions_dir(&edit_path));
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -2099,6 +3558,17 @@ fn edit_list_revisions(edit_dir: String) -> Result<Vec<EpubRevision>, String> {
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.ends_with(".source") || name.ends_with(".forge.json") {
             continue;
+        }
+        if shared.is_some() {
+            // 共用目录：锻造快照（有 forge 元数据）不在这里列出
+            let id = name.trim_end_matches(".source");
+            if let Ok(text) = fs::read_to_string(dir.join(format!("{id}.json"))) {
+                if let Ok(meta) = serde_json::from_str::<RevisionMeta>(&text) {
+                    if meta.kind != "edit" {
+                        continue;
+                    }
+                }
+            }
         }
         let created_at = name
             .split('_')
@@ -2115,9 +3585,11 @@ fn edit_list_revisions(edit_dir: String) -> Result<Vec<EpubRevision>, String> {
 /// 回滚到某个快照：先把当前 EPUB 自动存档，再恢复到目标快照并重新解包。
 #[tauri::command]
 fn edit_restore_revision(
+    app: tauri::AppHandle,
     edit_dir: String,
     origin_path: String,
     revision: String,
+    book_id: Option<String>,
 ) -> Result<EditWorkspace, String> {
     if revision.contains('/')
         || revision.contains('\\')
@@ -2131,23 +3603,42 @@ fn edit_restore_revision(
     if !origin.exists() {
         return Err("原 EPUB 不存在，无法回滚".into());
     }
-    let dir = edit_revisions_dir(&edit_path);
+    let shared = book_id.as_deref().filter(|v| valid_id(v)).map(|id| revisions_dir(&app, id)).transpose()?;
+    let dir = shared.clone().unwrap_or_else(|| edit_revisions_dir(&edit_path));
     let snapshot = dir.join(&revision);
     if !snapshot.exists() {
         return Err("找不到这个历史快照".into());
     }
     // 回滚前自动存档当前文件
-    let stamp = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
     let stem = origin
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "book".into());
-    let auto = dir.join(format!("{}_auto_{}.source", stamp, stem));
-    fs::create_dir_all(&dir).ok();
-    fs::copy(&origin, &auto).map_err(|e| format!("回滚前自动存档失败：{e}"))?;
+    if shared.is_some() {
+        let rev = unique_revision_id(&dir);
+        let auto = dir.join(format!("{rev}.source"));
+        fs::create_dir_all(&dir).ok();
+        fs::copy(&origin, &auto).map_err(|e| format!("回滚前自动存档失败：{e}"))?;
+        let bytes = fs::metadata(&origin).map(|m| m.len()).unwrap_or(0);
+        let meta = RevisionMeta {
+            id: rev,
+            created_at: now_millis(),
+            label: "回滚前自动存档".into(),
+            source_bytes: bytes,
+            note: stem.clone(),
+            kind: "edit".into(),
+        };
+        write_revision_meta(&dir, &meta)?;
+        prune_revisions(&dir, 30)?;
+    } else {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let auto = dir.join(format!("{}_auto_{}.source", stamp, stem));
+        fs::create_dir_all(&dir).ok();
+        fs::copy(&origin, &auto).map_err(|e| format!("回滚前自动存档失败：{e}"))?;
+    }
 
     fs::copy(&snapshot, &origin).map_err(|e| format!("恢复快照失败：{e}"))?;
     ee::unpack_epub(&origin, &edit_path)
@@ -2160,15 +3651,18 @@ fn edit_scan_blocks(edit_dir: String, rel_path: String) -> Result<Vec<ee::BlockI
     ee::scan_blocks(&edit_path, &rel_path)
 }
 
-/// 只回写 dirty 块（未改动块逐字节保留），并做 XML 合法性校验
+/// 只回写 dirty 块（未改动块逐字节保留），并做 XML 合法性校验；
+/// `inserts` 用于 D 阶段的新建段落 / 标题 / 空行。
 #[tauri::command]
 fn edit_write_blocks(
     edit_dir: String,
     rel_path: String,
     edits: Vec<ee::BlockEdit>,
+    inserts: Option<Vec<ee::InsertEdit>>,
 ) -> Result<ee::BlockWriteResult, String> {
     let edit_path = PathBuf::from(&edit_dir);
-    ee::write_blocks(&edit_path, &rel_path, &edits)
+    let inserts = inserts.unwrap_or_default();
+    ee::write_blocks_with_inserts(&edit_path, &rel_path, &edits, &inserts)
 }
 
 /// S6：ForgePanel EPUB 锻造索引。解压 EPUB → spine 顺序 → 逐 xhtml 分块 → 扁平映射。
@@ -2176,10 +3670,12 @@ fn edit_write_blocks(
 /// flat_blocks（ForgePanel editKey → EPUB rel_path + block_index）、edit_dir（解压目录，后续 edit_write_blocks 用）。
 #[tauri::command]
 fn forge_epub_index(
+    app: tauri::AppHandle,
     epub_path: String,
     edit_dir: String,
 ) -> Result<ee::ForgeEpubIndex, String> {
-    let src = PathBuf::from(&epub_path);
+    // 同 edit_open_epub：旧目录名/旧散装路径自动纠正
+    let src = resolve_existing_source(&app, &epub_path);
     if !src.exists() {
         return Err(format!("EPUB 源文件不存在: {}", epub_path));
     }
@@ -2683,13 +4179,30 @@ mod tests {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // 启动时把旧式散装书与旧目录名迁到「书名__短编号」；失败不阻塞启动
+            let handle = app.handle().clone();
+            let changed = migrate_library_layout(&handle).unwrap_or(0);
+            let has_index = library_index_path(&handle)
+                .map(|path| path.is_file())
+                .unwrap_or(false);
+            // 迁移过或索引缺失/损坏时重建一次，让后续 book_dir 解析走索引
+            if changed > 0 || !has_index || load_library_index(&handle).books.is_empty() {
+                let previous = load_library_index(&handle);
+                let index = rebuild_library_index(&handle, &previous);
+                let _ = save_library_index(&handle, &index);
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_args,
             read_book,
             import_book,
             list_books,
             shelf_health,
+            library_check,
             read_book_bytes,
+            book_paths,
             save_cover,
             read_cover,
             get_settings,
@@ -2708,10 +4221,20 @@ fn main() {
             read_revision,
             restore_revision,
             translate_text,
+            baidu_translate,
+            baidu_llm_translate,
             read_glossary,
             write_glossary,
             read_translation_memory,
             write_translation_memory,
+            read_sidecar,
+            write_sidecar,
+            sidecar_info,
+            read_forge_draft,
+            write_forge_draft,
+            write_forge_state,
+            translation_save,
+            translation_export,
             read_text_file,
             write_text_file,
             check_epub,
@@ -2726,6 +4249,9 @@ fn main() {
             edit_read_toc,
             edit_write_toc,
             edit_rename_file,
+            edit_file_impact,
+            edit_create_chapter,
+            edit_delete_file,
             edit_scan_report,
             edit_scan_blocks,
             edit_write_blocks,
@@ -2734,7 +4260,10 @@ fn main() {
             file_exists,
             preview_image,
             edit_validate,
-            forge_epub_index
+            forge_epub_index,
+            nmt::nmt_status,
+            nmt::nmt_download,
+            nmt::nmt_translate
         ])
         .run(tauri::generate_context!())
         .expect("Scrollforge 启动失败");

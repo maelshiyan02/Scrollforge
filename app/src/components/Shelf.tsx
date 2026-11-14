@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AppSettings, BookMeta } from '../types'
-import { nextTheme, themeLabel, type Prefs, type ShelfSortOrder } from '../lib/prefs'
+import type { Prefs, ShelfSortOrder } from '../lib/prefs'
 import { lastReadAt, progressPercent } from '../lib/progress'
 import { coverUrl } from '../lib/cover'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -8,6 +8,7 @@ import Icon from './Icon'
 import { SortImportedIcon, SortOrderIcon, SortRecentIcon, SortTitleIcon } from './SortIcons'
 import WindowControls from './WindowControls'
 import Shelf3D from './Shelf3D'
+import AppMenu from './AppMenu'
 
 type Props = {
   books: BookMeta[]
@@ -21,6 +22,8 @@ type Props = {
   onOpenFile: () => void
   onRefresh: () => void
   onSettings: () => void
+  onHelp: () => void
+  onAbout: () => void
   onConvert: (book?: BookMeta) => void
   onCheck: (book: BookMeta) => void
   onEditEpub: (book: BookMeta) => void
@@ -133,6 +136,8 @@ export default function Shelf({
   onOpenFile,
   onRefresh,
   onSettings,
+  onHelp,
+  onAbout,
   onConvert,
   onCheck,
   onEditEpub,
@@ -477,28 +482,12 @@ export default function Shelf({
           <span className="sep" />
           <button
             className="btn icon-only"
-            data-tip={`界面主题：${themeLabel(prefs.theme)}（点击切换日间 / 护眼 / 夜间）`}
-            aria-label="切换界面主题"
-            onClick={() => onPrefs({ theme: nextTheme(prefs.theme) })}
-          >
-            <Icon name={prefs.theme === 'night' ? 'brightness_3' : prefs.theme === 'eye' ? 'visibility' : 'wb_sunny'} />
-          </button>
-          <button
-            className="btn icon-only"
             data-tip="刷新书架（重新扫描本地书库与阅读历史）"
             aria-label="刷新书架"
             disabled={busy}
             onClick={onRefresh}
           >
             <Icon name="refresh" />
-          </button>
-          <button
-            className="btn icon-only"
-            data-tip="设置：文件夹位置、导入偏好、功能开关与说明书"
-            aria-label="设置"
-            onClick={onSettings}
-          >
-            <Icon name="settings" />
           </button>
         </div>
       </div>
@@ -585,6 +574,13 @@ export default function Shelf({
       </main>
 
       <footer className="shelf-status">
+        <AppMenu
+          prefs={prefs}
+          onPrefs={onPrefs}
+          onSettings={onSettings}
+          onHelp={onHelp}
+          onAbout={onAbout}
+        />
         <span>{tab === 'history' ? '阅读历史' : '书库'} · 共 {sourceBooks.length} 本</span>
         <span className="dot">·</span>
         <span>TXT {sourceBooks.filter((b) => b.format === 'txt').length} 本</span>

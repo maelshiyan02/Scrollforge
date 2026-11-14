@@ -6,7 +6,9 @@ export type ShelfSort = 'recent' | 'imported' | 'title'
 /** 书架排序方向：asc 升序 / desc 降序 */
 export type ShelfSortOrder = 'asc' | 'desc'
 export type ConvertPreset = 'zh-serif' | 'en-serif' | 'minimal'
-export type TranslateMode = 'auto' | 'local' | 'online'
+export type TranslateMode = 'auto' | 'local' | 'online' | 'baidu' | 'baiduLlm'
+/** 本地引擎实现：builtin 内置 ONNX 模型；http 走 Ollama / LM Studio 等兼容接口 */
+export type TranslateBackend = 'builtin' | 'http'
 export type TranslateStyle = 'literary' | 'faithful' | 'casual'
 export type TranslateSource = 'auto' | 'zh' | 'en' | 'ja' | 'ko' | 'fr' | 'de' | 'ru' | 'es'
 export type TranslateTarget = 'zh' | 'en' | 'ja' | 'ko' | 'fr' | 'de' | 'ru' | 'es'
@@ -44,14 +46,22 @@ export type Prefs = {
   convertCenterHeading: boolean
   /** 固定版式下 Ctrl+滚轮缩放 */
   experimentalFixedWheelZoom: boolean
-  /** 翻译引擎模式：自动（在线失败回落本地）/ 仅本地 / 仅在线 */
+  /** 翻译引擎模式：自动（在线失败回落本地）/ 仅本地 / 仅在线 / 百度翻译 / 百度大模型 */
   translateMode: TranslateMode
+  /** 本地引擎实现：内置离线模型 / 本机 HTTP 服务 */
+  translateBackend: TranslateBackend
+  /** 内置离线模型存放目录；空则落到应用数据目录 */
+  translateModelDir: string
   /** 在线引擎：OpenAI 兼容接口地址 */
   translateOnlineEndpoint: string
   /** 在线引擎：API Key（只存本机） */
   translateOnlineKey: string
   /** 在线引擎：模型名 */
   translateOnlineModel: string
+  /** 百度翻译开放平台 APP ID */
+  translateBaiduAppId: string
+  /** 百度翻译开放平台密钥（只存本机） */
+  translateBaiduKey: string
   /** 本地引擎：Ollama / LM Studio 等兼容接口地址 */
   translateLocalEndpoint: string
   /** 本地引擎：模型名 */
@@ -82,10 +92,14 @@ export const DEFAULT_PREFS: Prefs = {
   convertIndent: true,
   convertCenterHeading: true,
   experimentalFixedWheelZoom: true,
-  translateMode: 'auto',
+  translateMode: 'local',
+  translateBackend: 'builtin',
+  translateModelDir: 'D:\\AI Coding Project Management\\Scrollforge\\models',
   translateOnlineEndpoint: 'https://api.deepseek.com/v1',
   translateOnlineKey: '',
   translateOnlineModel: 'deepseek-chat',
+  translateBaiduAppId: '',
+  translateBaiduKey: '',
   translateLocalEndpoint: 'http://127.0.0.1:11434/v1',
   translateLocalModel: 'qwen2.5:7b',
   translateStyle: 'literary',
@@ -104,7 +118,8 @@ const SHELF_SORTS: ShelfSort[] = ['recent', 'imported', 'title']
 const SHELF_SORT_ORDERS: ShelfSortOrder[] = ['asc', 'desc']
 const READER_FLOWS: ReaderFlow[] = ['paginated', 'scrolled']
 const PRESETS: ConvertPreset[] = ['zh-serif', 'en-serif', 'minimal']
-const TRANSLATE_MODES: TranslateMode[] = ['auto', 'local', 'online']
+const TRANSLATE_MODES: TranslateMode[] = ['auto', 'local', 'online', 'baidu', 'baiduLlm']
+const TRANSLATE_BACKENDS: TranslateBackend[] = ['builtin', 'http']
 const TRANSLATE_STYLES: TranslateStyle[] = ['literary', 'faithful', 'casual']
 const TRANSLATE_SOURCES: TranslateSource[] = ['auto', 'zh', 'en', 'ja', 'ko', 'fr', 'de', 'ru', 'es']
 const TRANSLATE_TARGETS: TranslateTarget[] = ['zh', 'en', 'ja', 'ko', 'fr', 'de', 'ru', 'es']
@@ -128,6 +143,10 @@ export function loadPrefs(): Prefs {
     const raw = localStorage.getItem(KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<Prefs>
+      const localEndpoint = pickString(parsed.translateLocalEndpoint, DEFAULT_PREFS.translateLocalEndpoint)
+      const localModel = pickString(parsed.translateLocalModel, DEFAULT_PREFS.translateLocalModel)
+      // 清掉历史调试残留：18081/18082 是临时测试端口，mock 是假模型，正常用户不会用到
+      const staleLocal = /127\.0\.0\.1:1808[12]/.test(localEndpoint) || localModel.trim() === 'mock'
       return {
         theme: pick(parsed.theme, THEMES, DEFAULT_PREFS.theme),
         readerFlow: pick(parsed.readerFlow, READER_FLOWS, DEFAULT_PREFS.readerFlow),
@@ -145,11 +164,15 @@ export function loadPrefs(): Prefs {
         convertCenterHeading: parsed.convertCenterHeading !== false,
         experimentalFixedWheelZoom: parsed.experimentalFixedWheelZoom !== false,
         translateMode: pick(parsed.translateMode, TRANSLATE_MODES, DEFAULT_PREFS.translateMode),
+        translateBackend: pick(parsed.translateBackend, TRANSLATE_BACKENDS, DEFAULT_PREFS.translateBackend),
+        translateModelDir: pickString(parsed.translateModelDir, DEFAULT_PREFS.translateModelDir),
         translateOnlineEndpoint: pickString(parsed.translateOnlineEndpoint, DEFAULT_PREFS.translateOnlineEndpoint),
         translateOnlineKey: pickString(parsed.translateOnlineKey, ''),
         translateOnlineModel: pickString(parsed.translateOnlineModel, DEFAULT_PREFS.translateOnlineModel),
-        translateLocalEndpoint: pickString(parsed.translateLocalEndpoint, DEFAULT_PREFS.translateLocalEndpoint),
-        translateLocalModel: pickString(parsed.translateLocalModel, DEFAULT_PREFS.translateLocalModel),
+        translateBaiduAppId: pickString(parsed.translateBaiduAppId, ''),
+        translateBaiduKey: pickString(parsed.translateBaiduKey, ''),
+        translateLocalEndpoint: staleLocal ? DEFAULT_PREFS.translateLocalEndpoint : localEndpoint,
+        translateLocalModel: staleLocal ? DEFAULT_PREFS.translateLocalModel : localModel,
         translateStyle: pick(parsed.translateStyle, TRANSLATE_STYLES, DEFAULT_PREFS.translateStyle),
         translateUseTm: parsed.translateUseTm !== false,
         translateSource: pick(parsed.translateSource, TRANSLATE_SOURCES, DEFAULT_PREFS.translateSource),

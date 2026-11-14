@@ -32,6 +32,31 @@ const SHAPE_PLACEHOLDER = '<span class="blk-img" contenteditable="false">［图�
 const PLACEHOLDER_RE =
   /<span class="blk-img" contenteditable="false">(?:［图片］|［图形］)<\/span>/g
 
+/** 只有链接、没有可见内容的空锚点，不算正文块 */
+function isAnchorOnly(el: Element): boolean {
+  return el.tagName.toLowerCase() === 'a'
+    && !el.firstElementChild
+    && !(el.textContent ?? '').trim()
+}
+
+/**
+ * 一段 XHTML 文档里的「顶层可编辑块」。
+ * 阅读器与编辑器的段落定位共用这一个口径，保证块序号一一对应。
+ */
+export function blockElements(doc: Document): Element[] {
+  const body = doc.querySelector('body')
+  if (!body) return []
+  let list = Array.from(body.children)
+  if (list.length === 1) {
+    const only = list[0]
+    const tag = only.tagName.toLowerCase()
+    if (['section', 'div', 'article'].includes(tag) && only.children.length > 0) {
+      list = Array.from(only.children)
+    }
+  }
+  return list.filter((el) => !isAnchorOnly(el))
+}
+
 /** 把一段块的 innerHTML 变成可显示 HTML，同时记住被替换掉的原始标签 */
 export function splitPreview(inner: string): { html: string; originals: string[] } {
   const originals: string[] = []
@@ -52,7 +77,7 @@ export function restorePreview(inner: string, originals: string[]): string {
   return inner.replace(PLACEHOLDER_RE, () => originals[index++] ?? '')
 }
 
-const ALLOWED_TAGS = new Set(['em', 'strong', 'i', 'b', 'a', 'span', 'br', 'img'])
+const ALLOWED_TAGS = new Set(['em', 'strong', 'i', 'b', 'u', 'a', 'span', 'br', 'img'])
 const ALLOWED_ATTRS = new Set(['href', 'title', 'src', 'alt', 'class'])
 /** 连同内容一起丢弃的危险标签 */
 const DROP_WITH_CONTENT = new Set([

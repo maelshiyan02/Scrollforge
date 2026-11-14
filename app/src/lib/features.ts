@@ -4,6 +4,17 @@ import type { Prefs } from './prefs'
 
 export type FeatureStatus = 'online' | 'beta' | 'planned'
 
+/** 功能分区：设置页左侧导航、帮助页章节都按这个分组 */
+export type FeatureGroup = 'reading' | 'editing' | 'forge' | 'translate' | 'general'
+
+export const GROUP_LABEL: Record<FeatureGroup, string> = {
+  reading: '阅读',
+  editing: '编辑',
+  forge: '锻造',
+  translate: '翻译',
+  general: '通用',
+}
+
 export type PrefKey = keyof Prefs
 
 type SettingCommon = {
@@ -35,13 +46,14 @@ export type SettingMeta =
       /** API Key 等敏感内容用密码框显示 */
       secret?: boolean
     })
-  | (SettingCommon & { kind: 'note'; action?: 'storage' | 'glossary' | 'translateTest' })
+  | (SettingCommon & { kind: 'note'; action?: 'storage' | 'glossary' | 'translateTest' | 'translateModel' })
 
 export type FeatureEntry = {
   id: string
   icon: string
   title: string
   status: FeatureStatus
+  group: FeatureGroup
   /** 入口位置，F1 说明书里做「在界面中高亮该按钮」的文字指引 */
   where: string
   desc: string
@@ -60,6 +72,7 @@ export const FEATURES: FeatureEntry[] = [
     icon: 'palette',
     title: '外观与护眼',
     status: 'online',
+    group: 'general',
     where: '设置页「功能」切面；书架与阅读页顶栏最右的调色按钮（日间 → 护眼 → 夜间循环）',
     desc:
       '日间是纸白底，保持原有观感；护眼是低饱和绿纸面，整体亮度与蓝光观感都更低；夜间是深灰纸面，不用纯黑以避免暗环境光晕。' +
@@ -90,6 +103,7 @@ export const FEATURES: FeatureEntry[] = [
     icon: 'auto_stories',
     title: '阅读与彩页',
     status: 'online',
+    group: 'reading',
     where: '阅读页顶栏：目录、单双页、横竖排、分页/滚动、排版（整页缩放）、彩页与插图',
     desc:
       'EPUB / MOBI / AZW3 / FB2 / CBZ / ZIP / PDF 直接按原书排版渲染；TXT / Markdown / HTML 走文本排版。' +
@@ -129,6 +143,7 @@ export const FEATURES: FeatureEntry[] = [
     icon: 'local_library',
     title: '书架',
     status: 'online',
+    group: 'general',
     where: '书架顶栏：网格 / 列表 / 3D 书架、排序、分类切面、刷新与设置',
     desc: '阅读历史与本地书库并存；网格、列表、3D 书架三视图，按最近阅读、导入时间或书名排序。',
     settings: [
@@ -166,6 +181,7 @@ export const FEATURES: FeatureEntry[] = [
     icon: 'edit_note',
     title: '编辑',
     status: 'online',
+    group: 'editing',
     where: '阅读页左上角「阅读 / 编辑」切换；编辑器内文件树、源码、段落、目录、元数据标签',
     desc:
       '解包 EPUB、编辑源码与段落、目录树与元数据写回、保存并重打包、另存为、epubcheck。' +
@@ -208,6 +224,7 @@ export const FEATURES: FeatureEntry[] = [
     icon: 'sync_alt',
     title: '转换与新建书',
     status: 'online',
+    group: 'general',
     where: '书架顶栏「新建书」与「转换」；书卡右键「转换为 EPUB」「导出文本」',
     desc:
       'TXT / Markdown / HTML / FB2 / CBZ / PDF 转 EPUB；EPUB 可导出 TXT / Markdown / HTML。' +
@@ -249,6 +266,7 @@ export const FEATURES: FeatureEntry[] = [
     icon: 'build',
     title: '锻造（TXT 精修）',
     status: 'beta',
+    group: 'forge',
     where: '阅读页顶栏「锻造」；只对从书架打开的 TXT 图书可用',
     desc: '逐段改写、翻译、注释并写回 TXT 源文件，先快照再写回，可查看 diff 与回滚。',
     settings: [
@@ -264,6 +282,7 @@ export const FEATURES: FeatureEntry[] = [
     icon: 'translate',
     title: '翻译',
     status: 'online',
+    group: 'translate',
     where: '阅读页「锻造台」：逐段「译本段」、整章「译本章」；设置 → 功能 → 翻译',
     desc:
       '韩译中 / 英译中：术语表 + 人称地名表先锁定专名，再交给本地或在线引擎翻译，' +
@@ -273,12 +292,40 @@ export const FEATURES: FeatureEntry[] = [
         kind: 'select',
         key: 'translateMode',
         label: '引擎模式',
-        hint: '自动：先在线，失败则回落本地；仅本地适合断网；仅在线适合已配好云端密钥。',
+        hint:
+          '自动：先在线，失败则回落本地；仅本地适合断网；仅在线适合已配好云端密钥；' +
+          '百度两档都用 APP ID + 密钥：通用版 QPS=1、大模型版 QPS=10 且支持翻译指令。' +
+          '百度两档翻译整章时会把整章段落合并成一次请求，按段落行对齐回填。',
         options: [
           { value: 'auto', label: '自动（在线 → 本地回落）' },
           { value: 'local', label: '仅本地引擎' },
           { value: 'online', label: '仅在线引擎' },
+          { value: 'baidu', label: '百度翻译（通用文本翻译）' },
+          { value: 'baiduLlm', label: '百度翻译（大模型，支持翻译指令）' },
         ],
+      },
+      {
+        kind: 'select',
+        key: 'translateBackend',
+        label: '本地引擎实现',
+        hint: '内置：ONNX 离线模型，首次需下载（约 900MB），之后断网可用；HTTP：连接 Ollama / LM Studio。',
+        options: [
+          { value: 'builtin', label: '内置离线模型（NLLB）' },
+          { value: 'http', label: '本机 HTTP（Ollama / LM Studio）' },
+        ],
+      },
+      {
+        kind: 'text',
+        key: 'translateModelDir',
+        label: '离线模型存放位置',
+        hint: '模型文件（约 900MB）落在这个目录下的 nllb_600m；默认放在 Scrollforge 主目录，避免占 C 盘。',
+        placeholder: 'D:\\AI Coding Project Management\\Scrollforge\\models',
+      },
+      {
+        kind: 'note',
+        label: '内置离线模型',
+        hint: '约 900MB，首次下载后可完全断网翻译；模型只存在本机，不上传任何内容。下载进度与落盘路径见下方。',
+        action: 'translateModel',
       },
       {
         kind: 'text',
@@ -301,6 +348,29 @@ export const FEATURES: FeatureEntry[] = [
         label: '在线模型名',
         hint: '与接口地址配套的模型标识，例如 deepseek-chat。',
         placeholder: 'deepseek-chat',
+      },
+      {
+        kind: 'text',
+        key: 'translateBaiduAppId',
+        label: '百度翻译 APP ID',
+        hint: '百度翻译开放平台 → 开发者信息 里的 APP ID；只在引擎模式选「百度翻译」时使用。',
+        placeholder: '2024xxxxxxxxxxxxxx',
+      },
+      {
+        kind: 'text',
+        key: 'translateBaiduKey',
+        label: '百度翻译密钥',
+        hint: '开发者信息里的密钥，只存本机；不要填 API Key。通用文本翻译免费用量为 100 万字符。',
+        placeholder: '密钥（字母 + 数字）',
+        secret: true,
+      },
+      {
+        kind: 'note',
+        label: '百度翻译限制',
+        hint:
+          '通用版不支持提示词，译文风格与通用术语不生效；大模型版会把风格与术语写成翻译指令（reference），效果更贴近文学化要求。' +
+          '两档都仍会对人名地名做占位符保护；通用版免费额度 QPS=1，大模型版 QPS=10，整章翻译会按约 2000 字/次自动分批。' +
+          '所有译文落库前统一繁转简，包括原文括号里的繁体汉字注释。',
       },
       {
         kind: 'text',
@@ -385,6 +455,7 @@ export const FEATURES: FeatureEntry[] = [
     icon: 'record_voice_over',
     title: '朗读',
     status: 'planned',
+    group: 'reading',
     where: '规划中：阅读页顶栏将新增「听书」按钮',
     desc: '按章朗读、语速与音色调校；默认系统语音，可切在线引擎与离线音色包。',
     settings: [
@@ -401,6 +472,7 @@ export const FEATURES: FeatureEntry[] = [
     icon: 'science',
     title: '实验',
     status: 'beta',
+    group: 'general',
     where: '阅读页固定版式（PDF / 漫画 / 固定版式 EPUB）',
     desc: '不进正式验收的新交互先放在这里；出问题可随时关掉，不影响书库与文件。',
     settings: [
@@ -414,12 +486,48 @@ export const FEATURES: FeatureEntry[] = [
   },
 ]
 
-export const SHORTCUTS: { keys: string; label: string }[] = [
-  { keys: 'F1', label: '打开或关闭本说明书' },
-  { keys: 'Esc', label: '关闭当前弹层；阅读页没有弹层时返回书架' },
-  { keys: '← / PageUp', label: '上一页（竖排时方向自动反转）' },
-  { keys: '→ / PageDown / 空格', label: '下一页' },
-  { keys: 'Ctrl + 滚轮', label: '阅读页缩放：普通书改字号，固定版式按倍率缩放整页' },
-  { keys: 'Ctrl + 滚轮（编辑）', label: '源码框、目录、段落预览分别缩放字号' },
-  { keys: '← / →（全屏看图）', label: '切换上一张 / 下一张插图；Esc 关闭' },
+/** 快捷键按使用场景分组：说明书与设置页都按这个顺序展示 */
+export type ShortcutScope = 'universal' | 'shelf' | 'reading' | 'editing' | 'forge'
+
+export const SHORTCUT_SCOPE_LABEL: Record<ShortcutScope, string> = {
+  universal: '通用（任何页面）',
+  shelf: '书架主页',
+  reading: '阅读模式',
+  editing: '编辑模式',
+  forge: '锻造 / 翻译模式',
+}
+
+export const SHORTCUTS: { keys: string; label: string; scope: ShortcutScope }[] = [
+  // 通用
+  { keys: 'Esc', label: '关闭当前弹层 / 返回上一层；阅读页没有弹层时返回书架；设置与说明书整页按 Esc 关闭', scope: 'universal' },
+  { keys: 'F1', label: '打开或关闭帮助说明书（阅读页、设置页、说明书页内都可用）', scope: 'universal' },
+  { keys: 'Ctrl + ,', label: '打开设置整页（书架与阅读页）', scope: 'universal' },
+  { keys: '滚轮 / ↑ ↓', label: '上下滚动长页面：说明书、设置列表、阅读页滚动排版', scope: 'universal' },
+  { keys: 'Ctrl + Z', label: '撤销：编辑模式撤销段落改动，锻造模式撤销当前译文改动', scope: 'universal' },
+  { keys: 'Ctrl + Shift + Z', label: '重做：编辑模式恢复刚撤销的段落改动', scope: 'universal' },
+  // 书架
+  { keys: '滚轮 / ↑ ↓', label: '在书架与书单里上下浏览', scope: 'shelf' },
+  { keys: '单击书籍', label: '打开这本书；右键卡片可编辑 / 转换 / 删除', scope: 'shelf' },
+  { keys: '拖拽文件到窗口', label: '按「设置 → 导入」勾选的格式导入', scope: 'shelf' },
+  // 阅读
+  { keys: '← / PageUp', label: '上一页（竖排或从右往左排版时方向自动反转）', scope: 'reading' },
+  { keys: '→ / PageDown / 空格', label: '下一页', scope: 'reading' },
+  { keys: 'Ctrl + ← / Ctrl + →', label: '上一章 / 下一章（按目录跳转，不逐页翻）', scope: 'reading' },
+  { keys: '↑ ↓', label: '滚动排版时上下滑动', scope: 'reading' },
+  { keys: 'T', label: '展开 / 收起目录侧栏', scope: 'reading' },
+  { keys: 'E', label: '进入编辑模式（仅 EPUB；其它格式需先转换为 EPUB 工作副本）', scope: 'reading' },
+  { keys: 'G', label: '进入锻造 / 翻译模式（需要已解析出章节）', scope: 'reading' },
+  { keys: 'Ctrl + 滚轮', label: '缩放：普通书改字号，固定版式（PDF / 漫画）按倍率缩放整页', scope: 'reading' },
+  { keys: '← / →（全屏看图）', label: '切换上一张 / 下一张插图；Esc 关闭', scope: 'reading' },
+  { keys: '单击书内图片', label: '打开全屏看图', scope: 'reading' },
+  { keys: 'Esc', label: '依次关闭脚注 / 画廊 / 阅读设置 / 目录；都关着时返回书架', scope: 'reading' },
+  // 编辑
+  { keys: 'Ctrl + Z', label: '撤销段落改动（文字、删除、新建、上移下移都算一步）', scope: 'editing' },
+  { keys: 'Ctrl + Shift + Z', label: '重做段落改动', scope: 'editing' },
+  { keys: 'Ctrl + U', label: '给选中文字加 / 去下划线（粗体、斜体、链接同在有按钮）', scope: 'editing' },
+  { keys: 'Ctrl + 滚轮', label: '缩放源码框 / 段落预览字号', scope: 'editing' },
+  { keys: 'Esc', label: '回到阅读模式；有未保存改动时先弹确认', scope: 'editing' },
+  // 锻造
+  { keys: 'Ctrl + Z', label: '撤销当前段译文（含 AI 翻译 / 润色结果）', scope: 'forge' },
+  { keys: 'Esc', label: '回到阅读模式（不改动原文，译文留在草稿里）', scope: 'forge' },
 ]

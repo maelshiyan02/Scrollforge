@@ -4,13 +4,14 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import '../vendor/foliate-js/view.js'
 import { FootnoteHandler } from '../vendor/foliate-js/footnotes.js'
 import AnnotationTools from './AnnotationTools'
-import ForgePanel from './ForgePanel'
-import EpubEditPanel from './EpubEditPanel'
+import ForgePanel, { type ForgeToolbarState } from './ForgePanel'
+import EpubEditPanel, { type EditTab, type EditToolbarState } from './EpubEditPanel'
 import Icon from './Icon'
 import ImageViewer, { type ViewerImage } from './ImageViewer'
 import WindowControls from './WindowControls'
 import { decodeText } from '../lib/encoding'
 import { toPlainText } from '../lib/book-text'
+import { blockElements } from '../lib/inline-format'
 import { analyzeTxt, type TxtAnalysis } from '../lib/txt-chapters'
 import { buildTxtBook } from '../lib/txt-book'
 import { buildEpub, bytesToBase64 } from '../lib/epub-writer'
@@ -64,7 +65,6 @@ type Props = {
   onBack: () => void
   onOpenEpub: () => void
   onNotify: (message: string) => void
-  libraryDir?: string | null
   /** 最终成品文件夹：编辑面板「另存为」的默认位置 */
   exportDir?: string | null
   /** 阅读/编辑偏好（默认翻页方式、竖排、编辑器字号等） */
@@ -77,6 +77,22 @@ type Props = {
   autoEditBookId?: string | null
   onAutoEditConsumed?: () => void
 }
+
+/** P2：三档共享的阅读上下文（章节 href / 段落块 / CFI / 编辑文件） */
+type BookContext = {
+  href?: string
+  relPath?: string
+  blockIndex?: number
+  cfi?: string
+  chapterIndex?: number
+}
+
+/** 编辑档统一顶栏里的视图切换（源码已并入段落视图的三态，不再单列） */
+const EDIT_TABS: { value: EditTab; label: string; icon: string }[] = [
+  { value: 'blocks', label: '段落视图', icon: 'article' },
+  { value: 'meta', label: '元数据', icon: 'sell' },
+  { value: 'toc', label: '目录结构', icon: 'account_tree' },
+]
 
 function flattenToc(items: RawTocItem[] | undefined, depth = 0): TocEntry[] {
   if (!items?.length) return []
@@ -106,6 +122,14 @@ function hrefKey(href: string | undefined | null): string {
 const COVER_PAGE_RE = /(^|\/)(cover|cover[-_.]?\w*)\.[a-z]+$/i
 /** 前置页：封面、书名页、简介、目录页都不算正文起点 */
 const FRONT_PAGE_RE = /(^|\/)(cover|cover[-_.]?\w*|title_?page|titlepage|intro|about|preface|foreword|nav|toc|contents)\.[a-z]+$/i
+/** 彩页与插图页：文件清单里存在，但不属于正文章节 */
+const PLATE_PAGE_RE = /(^|\/)(color|plate|illustration|彩页)[-_.\w]*\.[a-z]+$/i
+
+/** 阅读档「章节列表」只保留正文章节：排除封面/前置页与彩页，分组标题保留 */
+function isChapterHref(href?: string): boolean {
+  const key = hrefKey(href)
+  return !!key && !FRONT_PAGE_RE.test(key) && !PLATE_PAGE_RE.test(key)
+}
 
 function findCoverHref(sections: any[] | undefined, toc: any[] | undefined): string | undefined {
   const fromToc = toc?.find((entry: any) => entry?.href && COVER_PAGE_RE.test(hrefKey(entry.href)))
@@ -178,7 +202,6 @@ export default function Reader({
   onBack,
   onOpenEpub,
   onNotify,
-  libraryDir,
   exportDir,
   prefs,
   onPrefs,
@@ -224,19 +247,59 @@ export default function Reader({
   const [error, setError] = useState('')
   const [viewEl, setViewEl] = useState<FoliateView | null>(null)
   const [footnote, setFootnote] = useState<Footnote | null>(null)
-  const [forgeOpen, setForgeOpen] = useState(false)
-  const [editOpen, setEditOpen] = useState(false)
+  // 三档合一：同一本书的阅读 / 编辑 / 锻造三种视图模式
+  const [mode, setMode] = useState<'read' | 'edit' | 'forge'>('read')
+  const editOpen = mode === 'edit'
+  const forgeOpen = mode === 'forge'
   const editDirtyRef = useRef(false)
-  // 最近一次 relocate 的位置，用于「阅读 → 编辑」时对齐章节与段落
+  /** 编辑档工具栏状态（由 EpubEditPanel 上报，顶栏据此渲染唯一一行按钮） */
+  const editToolbarRef = useRef<EditToolbarState | null>(null)
+  const [, setEditToolbarTick] = useState(0)
+  const onEditToolbar = useCallback((state: EditToolbarState | null) => {
+    const prev = editToolbarRef.current
+    editToolbarRef.current = state
+    if (
+      !state ||
+      !prev ||
+      prev.tab !== state.tab ||
+      prev.dirty !== state.dirty ||
+      prev.saving !== state.saving ||
+      prev.checking !== state.checking ||
+      prev.hasWorkspace !== state.hasWorkspace ||
+      prev.treeOpen !== state.treeOpen
+    ) {
+      setEditToolbarTick((n) => n + 1)
+    }
+  }, [])
+  /** 锻造档工具栏状态（章节抽屉开关由锻造面板上报，顶栏渲染同一个文件树按钮） */
+  const forgeToolbarRef = useRef<ForgeToolbarState | null>(null)
+  const [, setForgeToolbarTick] = useState(0)
+  const onForgeToolbar = useCallback((state: ForgeToolbarState | null) => {
+    const prev = forgeToolbarRef.current
+    forgeToolbarRef.current = state
+    if (!state || !prev || prev.treeOpen !== state.treeOpen) {
+      setForgeToolbarTick((n) => n + 1)
+    }
+  }, [])
   const lastLocRef = useRef<any>(null)
+  /** P2 上下文接力：阅读档的位置（章节 href / 段落块 / CFI）三档共享 */
+  const bookContextRef = useRef<BookContext>({})
+  /** 编辑档回报的位置（当前文件 + 当前段落块） */
+  const editContextRef = useRef<BookContext>({})
+  /** 进入锻造档时算好的定位（章节序号 + 段落下标） */
+  const [forgeSeed, setForgeSeed] = useState<{ chapterIndex?: number; paragraphIndex?: number } | null>(null)
+  /** 划词译文送进编辑：一次性草稿 */
+  const [pendingTranslation, setPendingTranslation] = useState<{ href?: string; blockIndex?: number; translation: string } | null>(null)
+  /** 锻造写回后重新载入时按这个 CFI 回到原阅读位置 */
+  const restoreCfiRef = useRef<string | null>(null)
   const [editSeed, setEditSeed] = useState<{ href?: string; block?: number } | null>(null)
   /** 非 EPUB 书：转出的工作副本 EPUB 路径（编辑保存落在它上面） */
   const [workingEpub, setWorkingEpub] = useState<string | null>(null)
   const [preparingEdit, setPreparingEdit] = useState(false)
   const [forgeData, setForgeData] = useState<{ text: string; analysis: TxtAnalysis; encoding: string } | null>(null)
-  /** S6：EPUB 源 ForgePanel 映射表 + 编辑解压目录 */
   const [forgeEpubFlat, setForgeEpubFlat] = useState<{ chapterIndex: number; paragraphIndex: number; relPath: string; blockIndex: number; text: string }[] | null>(null)
-  const [forgeEpubEditDir, setForgeEpubEditDir] = useState<string | null>(null)
+  /** 后端解析出的正文与书目录真实路径（禁止前端用「书库根 + id」拼路径） */
+  const [bookPaths, setBookPaths] = useState<{ source: string; dir: string } | null>(null)
   const [reloadToken, setReloadToken] = useState(0)
   const [galleryOpen, setGalleryOpen] = useState(false)
   const [galleryLoading, setGalleryLoading] = useState(false)
@@ -253,6 +316,8 @@ export default function Reader({
   /** 可进入编辑：书库内 EPUB 直接编辑；文本格式先生成工作副本 EPUB 再编辑 */
   const editableFormat = source.kind === 'library'
     && (sourceFormat === 'epub' || ['txt', 'md', 'html', 'fb2'].includes(sourceFormat))
+  /** 可进入锻造：需要已生成锻造数据（书库内 EPUB / TXT） */
+  const forgeAvailable = source.kind === 'library' && !!forgeData
   const imageFormat = ['epub', 'cbz', 'zip'].includes(sourceFormat)
   const galleryAvailable = imageFormat && source.kind === 'library'
   const galleryHint = !imageFormat
@@ -387,6 +452,14 @@ export default function Reader({
     el.addEventListener('relocate', (event: Event) => {
       const detail = (event as CustomEvent).detail ?? {}
       lastLocRef.current = detail
+      // P2：记录章节 href / CFI，三档切换与写回后都靠它对齐
+      const secIndex = typeof detail?.section?.current === 'number' ? detail.section.current : undefined
+      const ctxHref = secIndex != null ? (viewRef.current?.book?.sections?.[secIndex]?.id as string | undefined) : undefined
+      bookContextRef.current = {
+        href: ctxHref,
+        cfi: typeof detail?.cfi === 'string' ? detail.cfi : undefined,
+        chapterIndex: chapterIndexOf(detail, tocRef.current, viewRef.current?.book?.sections),
+      }
       const fraction = typeof detail.fraction === 'number' ? detail.fraction : 0
       if (typeof detail.fraction === 'number') setFractionKnown(true)
       setPercent(Math.round(fraction * 100))
@@ -497,6 +570,7 @@ export default function Reader({
       saveEnabledRef.current = false
       setFractionKnown(false)
       setChapterIndex(-1)
+      setBookPaths(null)
       const saved = readProgress(keyRef.current)
       if (saved) setPercent(Math.round(saved.fraction * 100))
 
@@ -526,9 +600,12 @@ export default function Reader({
           // ─── S6：EPUB 书也生成 ForgePanel 数据（调 forge_epub_index） ───
           if (format === 'epub' && source.kind === 'library') {
             try {
-              const dir = (libraryDir ?? '').replace(/[\\/]$/, '')
-              const epubPath = source.meta.path || (dir ? `${dir}/${source.meta.id}/source.epub` : '')
-              const editDir = dir ? `${dir}/${source.meta.id}/forge_edit` : ''
+              // 路径以后端解析为准：书目录可能已从 <id> 改名为「书名__短编号」
+              const paths = await invoke<{ source: string; dir: string }>('book_paths', { id: source.meta.id })
+              if (cancelled) return
+              setBookPaths(paths)
+              const epubPath = paths.source
+              const editDir = `${paths.dir}/forge_edit`
               if (epubPath && editDir) {
                 const idx = await invoke<{ text: string; analysis: any; flatBlocks: any[]; editDir: string }>(
                   'forge_epub_index',
@@ -538,19 +615,18 @@ export default function Reader({
                 if (idx.analysis?.chapters?.length > 0) {
                   setForgeData({ text: idx.text, analysis: idx.analysis as TxtAnalysis, encoding: 'UTF-8' })
                   setForgeEpubFlat(idx.flatBlocks)
-                  setForgeEpubEditDir(editDir)
                 } else {
-                  setForgeData(null); setForgeEpubFlat(null); setForgeEpubEditDir(null)
+                  setForgeData(null); setForgeEpubFlat(null)
                 }
               } else {
-                setForgeData(null); setForgeEpubFlat(null); setForgeEpubEditDir(null)
+                setForgeData(null); setForgeEpubFlat(null)
               }
             } catch (err) {
               console.warn('forge_epub_index 失败：', err)
-              setForgeData(null); setForgeEpubFlat(null); setForgeEpubEditDir(null)
+              setForgeData(null); setForgeEpubFlat(null)
             }
           } else {
-            setForgeData(null); setForgeEpubFlat(null); setForgeEpubEditDir(null)
+            setForgeData(null); setForgeEpubFlat(null)
           }
           extraMeta = formatLabel(format)
         } else {
@@ -611,7 +687,7 @@ export default function Reader({
         const coverHref = isEpub ? findCoverHref(sections, view.book?.toc) : undefined
         const firstBodyHref = isEpub ? findFirstBodyHref(sections, view.book?.toc) : undefined
         firstBodyRef.current = firstBodyHref
-        const startTarget = saved?.cfi ?? coverHref ?? firstBodyHref
+        const startTarget = restoreCfiRef.current ?? saved?.cfi ?? coverHref ?? firstBodyHref
 
         try {
           await view.init({ lastLocation: startTarget, showTextStart: !startTarget })
@@ -628,6 +704,8 @@ export default function Reader({
         }
         if (cancelled) return
 
+        // 写回后按 CFI 恢复原阅读位置，成功落位后清掉一次性标记
+        restoreCfiRef.current = null
         setOnCover(isCoverSection(view.book?.sections, view.lastLocation?.section?.current))
         requestAnimationFrame(() => applyFixedZoom())
 
@@ -896,6 +974,24 @@ export default function Reader({
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null
       if (target?.tagName === 'INPUT' || target?.tagName === 'SELECT') return
+      // 编辑 / 锻造档：方向键留给编辑器，Esc 只回阅读档而不退出这本书
+      if (mode !== 'read') {
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          // 文件树浮层打开时，Esc 先收起抽屉，再按一次才回阅读档
+          if (mode === 'edit' && editToolbarRef.current?.treeOpen) {
+            editToolbarRef.current.toggleTree()
+            return
+          }
+          if (mode === 'forge' && forgeToolbarRef.current?.treeOpen) {
+            forgeToolbarRef.current.toggleTree()
+            return
+          }
+          if (mode === 'edit' && editDirtyRef.current && !confirm('编辑区有未保存改动，确定回到阅读模式？')) return
+          setMode('read')
+        }
+        return
+      }
       // 全屏看图优先：←/→ 切图，Esc 退出，不再翻页
       if (viewer) {
         if (event.key === 'Escape') {
@@ -916,9 +1012,17 @@ export default function Reader({
       }
       if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
         event.preventDefault()
+        if (event.ctrlKey || event.metaKey) {
+          void jumpChapter(1)
+          return
+        }
         void flip(vertical ? -1 : 1)
       } else if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
         event.preventDefault()
+        if (event.ctrlKey || event.metaKey) {
+          void jumpChapter(-1)
+          return
+        }
         void flip(vertical ? 1 : -1)
       } else if (event.key === 'Escape') {
         if (footnoteRef.current) closeFootnote()
@@ -926,6 +1030,21 @@ export default function Reader({
         else if (settingsOpen) setSettingsOpen(false)
         else if (tocOpen) setTocOpen(false)
         else onBack()
+      } else if (!event.ctrlKey && !event.metaKey && !event.altKey) {
+        // 阅读档字母键：T 目录 / E 编辑 / G 锻造（输入框、弹层打开时不抢键）
+        const letter = event.key.toLowerCase()
+        if (letter === 't' && !settingsOpen) {
+          event.preventDefault()
+          setTocOpen((value) => !value)
+        } else if (letter === 'e' && !settingsOpen && !tocOpen) {
+          event.preventDefault()
+          if (sourceFormat === 'epub') switchMode('edit')
+          else void seedFromReading()
+        } else if (letter === 'g' && !settingsOpen && !tocOpen) {
+          event.preventDefault()
+          if (forgeData) enterForge()
+          else onNotify('还没有解析出章节，暂时无法进入锻造模式')
+        }
       }
     }
     window.addEventListener('keydown', onKey)
@@ -934,17 +1053,19 @@ export default function Reader({
       window.removeEventListener('keydown', onKey)
       keyHandlerRef.current = () => {}
     }
-  }, [flip, vertical, settingsOpen, tocOpen, onBack, closeFootnote, galleryOpen, viewer])
+  }, [flip, vertical, settingsOpen, tocOpen, onBack, closeFootnote, galleryOpen, viewer, mode, sourceFormat, forgeData, onNotify])
 
   // 滚轮翻页 + Ctrl+滚轮缩放字号（窗口与 iframe 各挂一份）
   useEffect(() => {
     let lastFlip = 0
     const onWheel = (event: WheelEvent) => {
+      // 编辑 / 锻造档不翻页，滚轮交给各自的滚动容器
+      if (mode !== 'read') return
       const target = event.target as HTMLElement | null
       // 面板内部滚动（目录、排版、笔记、锻造）不抢滚轮
       if (
         target?.closest?.(
-          '.edit-panel, .typo-panel, .toc-panel, .footnote-pop, .forge-panel, .note-card, .note-mask, .ann-toolbar, .gallery-panel, .gallery-viewer, .read-progress',
+          '.edit-panel, .typo-panel, .toc-panel, .footnote-pop, .forge-panel, .note-card, .note-mask, .ann-toolbar, .ann-panel, .gallery-panel, .gallery-viewer, .read-progress',
         )
       ) {
         return
@@ -982,21 +1103,35 @@ export default function Reader({
       window.removeEventListener('wheel', onWheel)
       wheelHandlerRef.current = () => {}
     }
-  }, [flip, onTypography])
+  }, [flip, onTypography, mode])
 
   const setFontSize = (next: number) => {
     onTypography({ ...typography, fontSize: clampFontSize(next) })
   }
 
   /**
-   * 非 EPUB：先转出一个工作副本 EPUB（library/<id>/working.epub），已存在则复用，
+   * 解析书目录：路径的唯一来源是后端 book_paths。
+   * 前端禁止再用「书库根 + 书 id」拼路径——迁移改目录名后会指向不存在的旧目录。
+   */
+  const ensureBookPaths = async (): Promise<{ source: string; dir: string } | null> => {
+    if (bookPaths) return bookPaths
+    if (source.kind !== 'library') return null
+    const paths = await invoke<{ source: string; dir: string }>('book_paths', { id: source.meta.id })
+    setBookPaths(paths)
+    return paths
+  }
+
+  /**
+   * 非 EPUB：先转出一个工作副本 EPUB（<书目录>/working.epub），已存在则复用，
    * 避免每次编辑都重转、也避免覆盖上次的编辑成果。
    */
   const prepareWorkingCopy = async (): Promise<string | null> => {
     if (source.kind !== 'library') return null
-    const root = (libraryDir ?? '').replace(/[\\/]$/, '')
-    if (!root) return null
-    const target = `${root}/${source.meta.id}/working.epub`
+    const paths = await ensureBookPaths()
+    if (!paths) return null
+    const dir = paths.dir.replace(/[\\/]$/, '')
+    if (!dir) return null
+    const target = `${dir}/working.epub`
     if (await invoke<boolean>('file_exists', { path: target })) return target
     const buffer = await invoke<ArrayBuffer>('read_book_bytes', { id: source.meta.id })
     const decoded = decodeText(buffer)
@@ -1017,11 +1152,34 @@ export default function Reader({
   }
 
   /**
+   * P2：取当前阅读位置（章节 href + 顶层段落块序号），供「阅读 → 编辑 / 锻造」对齐。
+   * 块序号的算法与编辑器共用 blockElements，保证两边索引一一对应。
+   */
+  const captureReadingContext = (): BookContext => {
+    let blockIndex: number | undefined
+    const range: Range | undefined = lastLocRef.current?.range
+    if (range) {
+      try {
+        const doc = range.startContainer.ownerDocument as Document
+        const list = blockElements(doc)
+        const target = list.find((item) => item.contains(range.startContainer))
+        if (target) blockIndex = list.indexOf(target)
+      } catch {
+        // 位置信息拿不到就只按章节对齐
+      }
+    }
+    return { ...bookContextRef.current, blockIndex }
+  }
+
+  /**
    * 阅读 → 编辑：EPUB 直接进编辑器；文本格式先生成工作副本 EPUB。
    * EPUB 会把当前章节与顶层段落块作为「种子」，让编辑器直接定位。
+   * override 用于划词译文送进编辑时，按译文所属段落开面板。
    */
-  const seedFromReading = async () => {
+  const seedFromReading = async (override?: BookContext) => {
     if (editOpen) return
+    // 正常进入编辑时清掉上一次划词译文草稿，避免重复应用
+    if (!override) setPendingTranslation(null)
     if (sourceFormat !== 'epub') {
       setPreparingEdit(true)
       try {
@@ -1029,7 +1187,7 @@ export default function Reader({
         if (!target) { onNotify('无法创建工作副本：缺少书库目录'); return }
         setWorkingEpub(target)
         setEditSeed(null)
-        setEditOpen(true)
+        setMode('edit')
         onNotify('已生成工作副本 EPUB，编辑保存只写在这个副本上')
       } catch (err) {
         onNotify(`生成工作副本失败：${String(err)}`)
@@ -1038,46 +1196,109 @@ export default function Reader({
       }
       return
     }
-    const view = viewRef.current
-    let index: number | undefined
+    const ctx = override ?? captureReadingContext()
     try {
-      const contents = view?.renderer?.getContents?.() as Array<{ index?: number }> | undefined
-      if (contents?.length) index = contents[0]?.index
-    } catch {
-      // 渲染器还没就绪
+      // 先拿到真实书目录，避免面板拿到空路径后静默不渲染
+      await ensureBookPaths()
+    } catch (err) {
+      onNotify(`无法定位这本书的书目录：${String(err)}`)
+      return
     }
-    // sections[i].id 才是相对 OPF 的 href（如 OEBPS/content.opf + text/ch1.xhtml）
-    const href: string | undefined = typeof index === 'number'
-      ? (view?.book?.sections?.[index]?.id as string | undefined)
+    setEditSeed({ href: ctx.href, block: ctx.blockIndex })
+    setMode('edit')
+  }
+
+  /** 划词译文「送进编辑」：按译文所属章节打开编辑器，并把译文作为该段草稿 */
+  const sendTranslationToEdit = (payload: {
+    cfi: string
+    text: string
+    translation: string
+    index: number
+    block?: number
+  }) => {
+    if (!editableFormat) {
+      onNotify('这本书不支持编辑')
+      return
+    }
+    const view = viewRef.current
+    const href = view?.book?.sections?.[payload.index]?.id as string | undefined
+    setPendingTranslation({
+      href,
+      blockIndex: payload.block,
+      translation: payload.translation,
+    })
+    void seedFromReading({ href, blockIndex: payload.block, cfi: payload.cfi })
+    onNotify('已把划词译文送进编辑器，可直接修改该段')
+  }
+
+  /** 锻造定位：用 EPUB 段落映射把「章节 + 段落块」换算成 forge 的章节/段落下标 */
+  const resolveForgeSeed = (ctx: BookContext): { chapterIndex?: number; paragraphIndex?: number } | null => {
+    const flat = forgeEpubFlat
+    if (!flat?.length) return null // TXT：ForgePanel 按章节标题定位
+    const pathKey = (value?: string) => (value ? value.split('#')[0].replace(/\\/g, '/').toLowerCase() : '')
+    const relKey = pathKey(ctx.relPath)
+    const hrefKeyValue = pathKey(ctx.href)
+    const sameFile = (relPath: string) => {
+      const rp = pathKey(relPath)
+      if (relKey) return rp === relKey || rp.endsWith(`/${relKey}`)
+      if (hrefKeyValue) return rp === hrefKeyValue || rp.endsWith(`/${hrefKeyValue}`)
+      return false
+    }
+    const candidates = flat.filter((item) => sameFile(item.relPath))
+    if (!candidates.length) return null
+    const blockIndex = ctx.blockIndex
+    let hit = typeof blockIndex === 'number'
+      ? candidates.find((item) => item.blockIndex === blockIndex)
       : undefined
-    let block: number | undefined
-    const range: Range | undefined = lastLocRef.current?.range
-    if (range) {
-      try {
-        const doc = range.startContainer.ownerDocument as Document
-        let node: Node | null = range.startContainer
-        while (node && node.parentNode && node.parentNode !== doc.body) node = node.parentNode
-        if (node && doc.body && node.parentNode === doc.body) {
-          const idx = Array.prototype.indexOf.call(doc.body.children, node as Element)
-          if (idx >= 0) block = idx
-        }
-      } catch {
-        // 位置信息拿不到就只按章节对齐
-      }
+    if (!hit && typeof blockIndex === 'number') {
+      // 段落块在映射里没有精确命中时，退到同一文件里最接近的前一段
+      hit = candidates
+        .filter((item) => item.blockIndex <= blockIndex)
+        .sort((a, b) => b.blockIndex - a.blockIndex)[0]
     }
-    setEditSeed({ href, block })
-    setEditOpen(true)
+    hit = hit ?? candidates[0]
+    return { chapterIndex: hit.chapterIndex, paragraphIndex: hit.paragraphIndex }
+  }
+
+  /** 阅读 / 编辑 → 锻造：带着同章同段定位（写回后由 reloadAfterForge 按 CFI 回原位） */
+  const enterForge = () => {
+    if (!forgeData) return
+    const ctx = mode === 'edit' ? editContextRef.current : captureReadingContext()
+    setForgeSeed(resolveForgeSeed(ctx))
+    setMode('forge')
+  }
+
+  /** 锻造写回后：记下阅读位置，重载后按 CFI 回到原页 */
+  const reloadAfterForge = () => {
+    restoreCfiRef.current = bookContextRef.current.cfi ?? (lastLocRef.current?.cfi as string | undefined) ?? null
+    setReloadToken((n) => n + 1)
+  }
+
+  /** 三档切换：编辑档有未保存改动时先确认，再切走 */
+  const switchMode = (next: 'read' | 'edit' | 'forge') => {
+    if (next === mode) return
+    if (mode === 'edit' && editDirtyRef.current && !confirm('编辑区有未保存改动，确定切换模式？')) return
+    // 离开编辑档就丢掉一次性译文草稿
+    if (next !== 'edit') setPendingTranslation(null)
+    setMode(next)
   }
 
   // ─── 自动打开编辑面板（从 Shelf 右键跳转时） ───
   useEffect(() => {
     if (autoEditBookId && source.kind === 'library' && source.meta.id === autoEditBookId) {
-      if (sourceFormat === 'epub') setEditOpen(true)
+      if (sourceFormat === 'epub') setMode('edit')
       else void seedFromReading()
       onAutoEditConsumed?.()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoEditBookId, source, onAutoEditConsumed])
+
+  /** 编辑档工具栏（统一顶栏用） */
+  const editTool = mode === 'edit' ? editToolbarRef.current : null
+  const forgeTool = mode === 'forge' ? forgeToolbarRef.current : null
+
+  /** 阅读档「章节列表」：过滤前置页与彩页，只留正文章节 */
+  const chapterToc = toc.filter((entry) => !entry.href || isChapterHref(entry.href))
 
   return (
     <div className="app">
@@ -1093,31 +1314,124 @@ export default function Reader({
           <Icon name="arrow_back" />
         </button>
         <span className="sep" />
-        {editableFormat && (
-          <div className="mode-switch" role="group" aria-label="阅读与编辑模式">
+        {(editableFormat || forgeAvailable) && (
+          <div className="mode-switch" role="group" aria-label="阅读 / 编辑 / 锻造">
             <button
-              className={editOpen ? '' : 'on'}
+              className={mode === 'read' ? 'on' : ''}
               data-tip="阅读模式：正常翻页阅读"
-              onClick={() => {
-                if (editDirtyRef.current && !confirm('编辑区有未保存改动，确定切回阅读模式？')) return
-                setEditOpen(false)
-              }}
+              onClick={() => switchMode('read')}
             >
               阅读
             </button>
             <button
-              className={editOpen ? 'on' : ''}
-              disabled={preparingEdit}
-              data-tip={sourceFormat === 'epub'
-                ? '编辑模式：段落 / 源码 / 元数据 / 目录'
-                : `编辑模式：先把 ${formatLabel(sourceFormat)} 转成工作副本 EPUB`}
+              className={mode === 'edit' ? 'on' : ''}
+              disabled={!editableFormat || preparingEdit}
+              data-tip={!editableFormat
+                ? '这本书不支持编辑'
+                : sourceFormat === 'epub'
+                  ? '编辑模式：段落（富文本 / 源码 / 分屏对照）/ 元数据 / 目录结构'
+                  : `编辑模式：先把 ${formatLabel(sourceFormat)} 转成工作副本 EPUB`}
               onClick={() => void seedFromReading()}
             >
               {preparingEdit ? '转换中…' : '编辑'}
             </button>
+            <button
+              className={mode === 'forge' ? 'on' : ''}
+              disabled={!forgeAvailable}
+              data-tip={forgeAvailable
+                ? '锻造模式：逐段翻译与注释，译文写入独立译文工程（不改母本）'
+                : '锻造只支持从书架打开的 EPUB / TXT 图书'}
+              onClick={enterForge}
+            >
+              锻造
+            </button>
           </div>
         )}
-        {!editOpen && (
+        {forgeTool && (
+          <>
+            <span className="sep" />
+            <button
+              className={`btn icon-only ${forgeTool.treeOpen ? 'on' : ''}`}
+              data-tip={forgeTool.treeOpen ? '收起章节列表' : '展开章节列表：切换要锻造的章节'}
+              aria-label="章节列表开关"
+              onClick={forgeTool.toggleTree}
+            >
+              <Icon name="folder" />
+            </button>
+          </>
+        )}
+        {editTool && (
+          <>
+            <span className="sep" />
+            {EDIT_TABS.map((item) => (
+              <button
+                key={item.value}
+                className={`btn icon-only ${editTool.tab === item.value ? 'on' : ''}`}
+                data-tip={item.label}
+                aria-label={item.label}
+                onClick={() => editTool.setTab(item.value)}
+              >
+                <Icon name={item.icon} />
+              </button>
+            ))}
+            <button
+              className={`btn icon-only ${editTool.treeOpen ? 'on' : ''}`}
+              data-tip={editTool.treeOpen ? '收起文件树' : '展开文件树'}
+              aria-label="文件树开关"
+              onClick={() => editTool.toggleTree()}
+            >
+              <Icon name="folder" />
+            </button>
+            <span className="sep" />
+            <button
+              className="btn icon-only"
+              data-tip="历史版本（保存时的快照）"
+              aria-label="历史版本"
+              disabled={!editTool.hasWorkspace}
+              onClick={() => editTool.actions.history()}
+            >
+              <Icon name="history" />
+            </button>
+            <button
+              className="btn icon-only"
+              data-tip="写回当前文件（Ctrl+S）"
+              aria-label="写回当前文件"
+              disabled={!editTool.dirty}
+              onClick={() => editTool.actions.write()}
+            >
+              <Icon name="save" />
+            </button>
+            <button
+              className="btn icon-only"
+              data-tip="保存并重打包（覆盖原文件）"
+              aria-label="保存并重打包"
+              disabled={editTool.saving}
+              onClick={() => editTool.actions.save()}
+            >
+              <Icon name="archive" />
+            </button>
+            <button
+              className="btn icon-only"
+              data-tip="另存为"
+              aria-label="另存为"
+              disabled={editTool.saving}
+              onClick={() => editTool.actions.saveAs()}
+            >
+              <Icon name="save_as" />
+            </button>
+            <button
+              className="btn icon-only"
+              data-tip="epubcheck 检查"
+              aria-label="epubcheck 检查"
+              disabled={editTool.checking}
+              onClick={() => editTool.actions.check()}
+            >
+              <Icon name="fact_check" />
+            </button>
+            {editTool.dirty && <span className="edit-dirty" data-tip="有未保存改动">●</span>}
+          </>
+        )}
+        {mode === 'read' && (
         <>
         <button
           className="btn primary icon-only"
@@ -1127,56 +1441,22 @@ export default function Reader({
         >
           <Icon name="folder_open" />
         </button>
-        <button
-          className="btn icon-only"
-          data-tip="上一页（←）"
-          aria-label="上一页"
-          onClick={() => void flip(vertical ? 1 : -1)}
-        >
-          <Icon name="chevron_left" />
-        </button>
-        <button
-          className="btn icon-only"
-          data-tip="下一页（→ 或 空格 / 滚轮）"
-          aria-label="下一页"
-          onClick={() => void flip(vertical ? -1 : 1)}
-        >
-          <Icon name="chevron_right" />
-        </button>
-        <button
-          className="btn icon-only"
-          disabled={toc.length === 0 || chapterIndex <= 0}
-          data-tip={
-            toc.length === 0 ? '这本书没有目录' : chapterIndex <= 0 ? '已经是第一章' : '上一章（跳到上一章开头）'
-          }
-          aria-label="上一章"
-          onClick={() => void jumpChapter(-1)}
-        >
-          <Icon name={vertical ? 'skip_next' : 'skip_previous'} />
-        </button>
-        <button
-          className="btn icon-only"
-          disabled={toc.length === 0 || chapterIndex < 0 || chapterIndex >= toc.length - 1}
-          data-tip={
-            toc.length === 0
-              ? '这本书没有目录'
-              : chapterIndex >= toc.length - 1
-                ? '已经是最后一章'
-                : '下一章（跳到下一章开头）'
-          }
-          aria-label="下一章"
-          onClick={() => void jumpChapter(1)}
-        >
-          <Icon name={vertical ? 'skip_previous' : 'skip_next'} />
-        </button>
         <span className="sep" />
         <button
           className={`btn icon-only ${tocOpen ? 'on' : ''}`}
-          data-tip="展开目录（点击章节跳转）"
-          aria-label="目录"
+          data-tip="展开章节列表（仅正文章节，点击跳转）"
+          aria-label="章节列表"
           onClick={() => setTocOpen((v) => !v)}
         >
           <Icon name="toc" />
+        </button>
+        <button
+          className="btn icon-only"
+          data-tip="标注面板：按章查看高亮 / 笔记 / 划词译文，可跳转、编辑、删除；Ctrl+Z 撤销最近一次标注操作"
+          aria-label="标注面板"
+          onClick={() => window.dispatchEvent(new Event('scrollforge:annotation-panel'))}
+        >
+          <Icon name="bookmarks" />
         </button>
         <button
           className={`btn icon-only ${doublePage ? 'on' : ''}`}
@@ -1225,19 +1505,6 @@ export default function Reader({
         >
           <Icon name="photo_library" />
         </button>
-        <button
-          className={`btn icon-only ${forgeOpen ? 'on' : ''}`}
-          disabled={!forgeData || source.kind !== 'library'}
-          data-tip={
-            forgeData && source.kind === 'library'
-              ? '逐段改写、翻译、注释，写回 EPUB / TXT 源文件（可回滚）'
-              : '锻造只支持从书架打开的 EPUB / TXT 图书'
-          }
-          aria-label="锻造"
-          onClick={() => setForgeOpen((v) => !v)}
-        >
-          <Icon name="build" />
-        </button>
         </>
         )}
         <button
@@ -1264,7 +1531,16 @@ export default function Reader({
           </div>
         )}
 
-        <AnnotationTools view={viewEl} bookKey={keyRef.current} prefs={prefs} onNotify={onNotify} />
+        {!editOpen && !forgeOpen && (
+          <AnnotationTools
+            view={viewEl}
+            bookKey={keyRef.current}
+            bookId={source.kind === 'library' ? source.meta.id : undefined}
+            prefs={prefs}
+            onNotify={onNotify}
+            onSendToEdit={editableFormat ? sendTranslationToEdit : undefined}
+          />
+        )}
 
         {galleryOpen && (
           <div className="gallery-panel">
@@ -1331,36 +1607,28 @@ export default function Reader({
           />
         )}
 
-        {forgeOpen && forgeData && source.kind === 'library' && (() => {
-          const dir = (libraryDir ?? '').replace(/[\\/]$/, '')
-          const epubOutputPath = sourceFormat === 'epub'
-            ? (source.meta.path || (dir ? `${dir}/${source.meta.id}/source.epub` : ''))
-            : ''
-          return (
+        {forgeOpen && forgeData && source.kind === 'library' && (
           <ForgePanel
             bookId={source.meta.id}
             bookTitle={title}
-            rawText={forgeData.text}
             analysis={forgeData.analysis}
             prefs={prefs}
             currentChapter={chapter}
-            onClose={() => setForgeOpen(false)}
+            initialChapterIndex={forgeSeed?.chapterIndex}
+            initialBlock={forgeSeed?.paragraphIndex}
+            onClose={() => switchMode('read')}
             onNotify={onNotify}
-            onCommitted={() => setReloadToken((n) => n + 1)}
-            // S6：EPUB 源即时写回
-            epubEditDir={forgeEpubEditDir ?? undefined}
             epubFlatBlocks={forgeEpubFlat ?? undefined}
-            epubOutputPath={epubOutputPath || undefined}
+            onToolbar={onForgeToolbar}
+            embedded
           />
-          )
-        })()}
+        )}
 
         {/* EPUB 编辑器侧滑面板（E1；E6 支持文本格式经工作副本进入） */}
         {editOpen && editableFormat && (() => {
-          const dir = (libraryDir ?? '').replace(/[\\/]$/, '')
           // EPUB 用原文件；非 EPUB 用转出的工作副本（working.epub）
           const epubPath = sourceFormat === 'epub'
-            ? (source.meta.path || (dir ? `${dir}/${source.meta.id}/source.epub` : ''))
+            ? (bookPaths?.source ?? '')
             : (workingEpub ?? '')
           if (!epubPath) return null
           return (
@@ -1370,12 +1638,21 @@ export default function Reader({
               exportDir={exportDir ?? undefined}
               initialHref={editSeed?.href}
               initialBlock={editSeed?.block}
+              pendingTranslation={pendingTranslation ?? undefined}
+              onContext={(ctx) => {
+                editContextRef.current = {
+                  relPath: ctx.relPath,
+                  blockIndex: ctx.blockIndex,
+                }
+              }}
               initialBlockFont={prefs.editorBlockFont}
               initialSrcFont={prefs.editorSrcFont}
               autoRebuild={prefs.editorAutoRebuild}
               createRevision={prefs.editorCreateRevision}
               prefs={prefs}
-              onClose={() => setEditOpen(false)}
+              embedded
+              onToolbar={onEditToolbar}
+              onClose={() => switchMode('read')}
               onNotify={onNotify}
               onDirtyChange={(v) => { editDirtyRef.current = v }}
               onCommitted={() => {
@@ -1488,23 +1765,23 @@ export default function Reader({
         {tocOpen && (
           <aside className="toc-panel">
             <div className="toc-head">
-              <span>目录</span>
-              <span className="toc-count">{toc.length ? `${toc.length} 节` : ''}</span>
+              <span>章节列表</span>
+              <span className="toc-count">{chapterToc.length ? `${chapterToc.length} 节` : ''}</span>
               <span className="grow" />
               <button
                 className="btn small icon-only"
-                data-tip="收起目录"
-                aria-label="收起目录"
+                data-tip="收起章节列表"
+                aria-label="收起章节列表"
                 onClick={() => setTocOpen(false)}
               >
                 <Icon name="close" size={16} />
               </button>
             </div>
-            {toc.length === 0 ? (
-              <div className="toc-empty">这本书没有目录信息</div>
+            {chapterToc.length === 0 ? (
+              <div className="toc-empty">这本书没有正文章节信息</div>
             ) : (
               <ol className="toc-list">
-                {toc.map((entry, index) => (
+                {chapterToc.map((entry, index) => (
                   <li
                     key={`${entry.href}-${index}`}
                     className={entry.group ? 'toc-group' : undefined}
@@ -1546,46 +1823,116 @@ export default function Reader({
         </aside>
       </main>
 
-      {!editOpen && (
-        <div className="read-bottom">
-          {fractionKnown && (
-            <div
-              className={`read-progress ${dragPercent != null ? 'dragging' : ''}`}
-              role="slider"
-              aria-label="阅读进度"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={dragPercent ?? percent}
-              onPointerDown={onProgressDown}
-              onPointerMove={onProgressMove}
-              onPointerUp={onProgressUp}
-              onPointerCancel={onProgressCancel}
-            >
-              <div className="read-progress-track" ref={progressTrackRef}>
-                <div className="read-progress-fill" style={{ width: `${dragPercent ?? percent}%` }} />
-                <div className="read-progress-knob" style={{ left: `${dragPercent ?? percent}%` }} />
-              </div>
-              {dragPercent != null && (
-                <span
-                  className="read-progress-bubble"
-                  style={{ left: `calc(14px + (100% - 28px) * ${dragPercent / 100})` }}
-                >
-                  {dragPercent}%
-                </span>
-              )}
+      <div className={`read-bottom${mode === 'read' ? '' : ' is-mode'}`}>
+        {mode === 'read' ? (
+          <>
+            <div className="status-nav">
+              <button
+                className="btn small icon-only"
+                disabled={toc.length === 0 || chapterIndex <= 0}
+                data-tip={
+                  toc.length === 0
+                    ? '这本书没有目录'
+                    : chapterIndex <= 0
+                      ? '已经是第一章'
+                      : '上一章（Ctrl+←）'
+                }
+                aria-label="上一章"
+                onClick={() => void jumpChapter(-1)}
+              >
+                <Icon name={vertical ? 'skip_next' : 'skip_previous'} size={17} />
+              </button>
+              <button
+                className="btn small icon-only"
+                data-tip="上一页（←）"
+                aria-label="上一页"
+                onClick={() => void flip(vertical ? 1 : -1)}
+              >
+                <Icon name="chevron_left" size={17} />
+              </button>
             </div>
-          )}
 
-          <footer className="status">
-            <span className="chapter">{chapter || '—'}</span>
+            {fractionKnown ? (
+              <div
+                className={`read-progress ${dragPercent != null ? 'dragging' : ''}`}
+                role="slider"
+                aria-label="阅读进度"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={dragPercent ?? percent}
+                onPointerDown={onProgressDown}
+                onPointerMove={onProgressMove}
+                onPointerUp={onProgressUp}
+                onPointerCancel={onProgressCancel}
+              >
+                <div className="read-progress-track" ref={progressTrackRef}>
+                  <div className="read-progress-fill" style={{ width: `${dragPercent ?? percent}%` }} />
+                  <div className="read-progress-knob" style={{ left: `${dragPercent ?? percent}%` }} />
+                </div>
+                {dragPercent != null && (
+                  <span
+                    className="read-progress-bubble"
+                    style={{ left: `calc(14px + (100% - 28px) * ${dragPercent / 100})` }}
+                  >
+                    {dragPercent}%
+                  </span>
+                )}
+              </div>
+            ) : (
+              <span className="grow" />
+            )}
+
+            <span className="read-percent">{dragPercent ?? percent}%</span>
+            <span className="read-chapter" title={chapter}>{chapter}</span>
+
+            <div className="status-nav">
+              <button
+                className="btn small icon-only"
+                data-tip="下一页（→ 或 空格 / 滚轮）"
+                aria-label="下一页"
+                onClick={() => void flip(vertical ? -1 : 1)}
+              >
+                <Icon name="chevron_right" size={17} />
+              </button>
+              <button
+                className="btn small icon-only"
+                disabled={toc.length === 0 || chapterIndex < 0 || chapterIndex >= toc.length - 1}
+                data-tip={
+                  toc.length === 0
+                    ? '这本书没有目录'
+                    : chapterIndex >= toc.length - 1
+                      ? '已经是最后一章'
+                      : '下一章（Ctrl+→）'
+                }
+                aria-label="下一章"
+                onClick={() => void jumpChapter(1)}
+              >
+                <Icon name={vertical ? 'skip_previous' : 'skip_next'} size={17} />
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <span className={`mode-badge ${mode}`}>{mode === 'edit' ? '编辑中' : '锻造中'}</span>
+            <span className="read-chapter" title={chapter}>{chapter || '未定位章节'}</span>
+            {mode === 'edit' && editTool && (
+              <>
+                <span className="mode-tab">
+                  {EDIT_TABS.find((item) => item.value === editTool.tab)?.label ?? ''}
+                </span>
+                <span className={`mode-state${editTool.dirty ? ' dirty' : ''}`}>
+                  {editTool.dirty ? '● 有未保存改动' : '已同步'}
+                </span>
+              </>
+            )}
+            {mode === 'forge' && <span className="mode-tab">逐段翻译 · 只写译文层</span>}
             <span className="grow" />
-            <span className="meta">{percent}%</span>
-            <span className="meta">{meta}</span>
-            <span className="meta">{vertical ? '竖排 · 右→左' : '横排 · 左→右'}</span>
-            <span className="meta">{flow === 'paginated' ? (doublePage ? '双页' : '单页') : '连续滚动'}</span>
-          </footer>
-        </div>
-      )}
+            {mode === 'edit' && (editTool?.saving || editTool?.checking) && (
+              <span className="mode-state">{editTool.saving ? '正在保存…' : '正在检查…'}</span>
+            )}
+          </>
+        )}
+      </div>
     </div>
   )
 }

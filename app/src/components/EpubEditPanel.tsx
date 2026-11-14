@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, ClipboardEvent as ReactClipboardEvent, PointerEvent as ReactPointerEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import Icon from './Icon'
 import {
   BLOCK_TAG_LABELS,
+  blockElements,
   isBlockTag,
   normalizeBlockBreaks,
   restorePreview,
@@ -12,7 +13,24 @@ import {
   splitPreview,
   textToInline,
 } from '../lib/inline-format'
-import { translateOne, translateConfigFromPrefs } from '../lib/translate'
+import { parseGlossary, type GlossaryEntry } from '../lib/glossary'
+import {
+  loadBookDrafts,
+  samePath,
+  subscribeDrafts,
+  removeDraft,
+  type TranslateDraftTable,
+} from '../lib/translate-drafts'
+import { loadBookAnnotations, type Annotation } from '../lib/annotations'
+import { applyChapterMarks, clearChapterMarks, collectChapterMarks } from '../lib/annotation-marks'
+import {
+  parseMemory,
+  rememberTranslation,
+  serializeMemory,
+  translateOne,
+  translateConfigFromPrefs,
+  type TranslationMemoryState,
+} from '../lib/translate'
 import { DEFAULT_PREFS, type Prefs } from '../lib/prefs'
 
 // ─── 类型（与 Rust serde 对齐） ───
@@ -81,6 +99,34 @@ interface ScanReport {
   tocSpineMismatch: string[]
 }
 
+/** S9：文件级操作影响面（与 Rust FileImpact 对齐） */
+interface FileImpact {
+  exists: boolean
+  inManifest: boolean
+  inSpine: boolean
+  inToc: boolean
+  refFiles: string[]
+  refCount: number
+}
+
+/** S9：文件级操作结果（与 Rust FileOpResult 对齐） */
+interface FileOpResult {
+  relPath: string
+  changedFiles: string[]
+  addedManifest: boolean
+  addedSpine: boolean
+  addedToc: boolean
+}
+
+type FileOpKind = 'create' | 'rename' | 'move'
+
+interface PendingFileOp {
+  kind: 'delete' | 'rename' | 'move'
+  from: string
+  to?: string
+  impact: FileImpact
+}
+
 /** 与 Rust BlockInfo 对齐：章节文件里的一个可编辑块 */
 interface BlockInfo {
   index: number
@@ -103,9 +149,25 @@ interface BlockEditPayload {
 interface BlockWriteResult {
   replaced: number
   deleted: number
+  inserted: number
   total: number
   bytesBefore: number
   bytesAfter: number
+}
+
+/** D 阶段：待新建的块（先挂在锚点后，应用改动时真正插入源码） */
+interface InsertRow {
+  id: number
+  tag: string
+  html: string
+}
+
+/** E 阶段：段落视图撤销快照（结构 + 文字 + 删除 + 新建） */
+interface BlockSnapshot {
+  rows: { html: string; tag: string }[]
+  deleted: number[]
+  edits: Record<number, string>
+  inserts: Record<number, InsertRow[]>
 }
 
 interface EpubRevision {
@@ -237,29 +299,10 @@ function depthOf(nodes: TocNode[]): number {
 }
 
 /**
- * 与 Rust scan_blocks_raw 同一规则：
+ * 与 Rust scan_blocks_raw 同一规则（实现放在 lib/inline-format.ts，阅读器共用）：
  * body 直接子元素；若 body 只有一个 section/div/article 包裹层则下钻一层；
  * 空锚点 <a id="x"></a> 不算块。两者索引必须一一对应，否则回写会错位。
  */
-function blockElements(doc: Document): Element[] {
-  const body = doc.querySelector('body')
-  if (!body) return []
-  let list = Array.from(body.children)
-  if (list.length === 1) {
-    const only = list[0]
-    const tag = only.tagName.toLowerCase()
-    if (['section', 'div', 'article'].includes(tag) && only.children.length > 0) {
-      list = Array.from(only.children)
-    }
-  }
-  return list.filter((el) => !isAnchorOnly(el))
-}
-
-function isAnchorOnly(el: Element): boolean {
-  return el.tagName.toLowerCase() === 'a'
-    && !el.firstElementChild
-    && !(el.textContent ?? '').trim()
-}
 
 function formatRevisionTime(seconds: number): string {
   if (!seconds) return '未知时间'
@@ -276,6 +319,128 @@ function safeLinkTarget(raw: string): string | null {
   return url
 }
 
+/** 块在 JS 字符串里的下标区间（Rust 给的是 UTF-8 字节偏移，不能直接切 JS 字符串） */
+interface CharSpan {
+  start: number
+  innerStart: number
+  innerEnd: number
+  end: number
+}
+
+function utf8Length(code: number): number {
+  if (code < 0x80) return 1
+  if (code < 0x800) return 2
+  if (code < 0x10000) return 3
+  return 4
+}
+
+/** 一批字节偏移一次性映射成字符下标（假定偏移落在标签边界，即 ASCII 字节上） */
+function toCharSpans(text: string, list: BlockInfo[]): CharSpan[] {
+  const wanted = Array.from(new Set(list.flatMap(b => [b.start, b.innerStart, b.innerEnd, b.end])))
+    .sort((a, b) => a - b)
+  const table = new Map<number, number>()
+  let bytes = 0
+  let i = 0
+  for (const target of wanted) {
+    while (i < text.length && bytes < target) {
+      const code = text.codePointAt(i) ?? 0
+      bytes += utf8Length(code)
+      i += code > 0xffff ? 2 : 1
+    }
+    table.set(target, i)
+  }
+  return list.map(b => ({
+    start: table.get(b.start) ?? 0,
+    innerStart: table.get(b.innerStart) ?? 0,
+    innerEnd: table.get(b.innerEnd) ?? 0,
+    end: table.get(b.end) ?? 0,
+  }))
+}
+
+/**
+ * 分屏对照：把富文本侧的实时改动合成到源码文本上（只在内存里，不写盘）。
+ * 与 applyBlocks 用同一套 restorePreview / sanitizeInline 规则，保证「所见即将要写入」。
+ * 同时给出「原文偏移 ↔ 草稿偏移」换算，供两侧光标对齐使用。
+ */
+interface DraftComposition {
+  text: string
+  toDraft: (base: number) => number
+  toBase: (draft: number) => number
+}
+
+function composeBlockDraft(
+  text: string,
+  spans: CharSpan[],
+  rows: BlockRow[],
+  edits: Record<number, string>,
+  deleted: Set<number>,
+  inserts: Record<number, InsertRow[]>,
+  insertHtml: Record<number, string>,
+): DraftComposition {
+  const ops: { from: number; to: number; insert: string }[] = []
+  rows.forEach((row, i) => {
+    const span = spans[i]
+    if (!span) return
+    if (deleted.has(i)) {
+      ops.push({ from: span.start, to: span.end, insert: '' })
+      return
+    }
+    const edited = edits[i]
+    const tagChanged = row.tag !== row.origTag
+    if (typeof edited !== 'string' && !tagChanged) return
+    const restored = typeof edited === 'string'
+      ? sanitizeInline(normalizeBlockBreaks(restorePreview(edited, row.originals))).xml
+      : text.slice(span.innerStart, span.innerEnd)
+    if (!tagChanged) {
+      ops.push({ from: span.innerStart, to: span.innerEnd, insert: restored })
+      return
+    }
+    const open = text.slice(span.start, span.innerStart)
+      .replace(/^<\s*[A-Za-z0-9:_-]+/, `<${row.tag}`)
+    const close = text.slice(span.innerEnd, span.end)
+      .replace(/<\/\s*[A-Za-z0-9:_-]+\s*>$/, `</${row.tag}>`)
+    ops.push({ from: span.start, to: span.end, insert: `${open}${restored}${close}` })
+  })
+  for (const [anchorKey, list] of Object.entries(inserts)) {
+    const anchor = Number(anchorKey)
+    const span = spans[anchor]
+    if (!span || deleted.has(anchor)) continue
+    const html = list.map(row => {
+      const raw = insertHtml[row.id] ?? row.html
+      return `<${row.tag}>${sanitizeInline(normalizeBlockBreaks(raw)).xml}</${row.tag}>`
+    }).join('')
+    if (html) ops.push({ from: span.end, to: span.end, insert: html })
+  }
+  const identity: DraftComposition = { text, toDraft: n => n, toBase: n => n }
+  if (!ops.length) return identity
+  const asc = [...ops].sort((a, b) => a.from - b.from)
+  const toDraft = (base: number) => {
+    let delta = 0
+    for (const op of asc) {
+      if (op.to <= base) { delta += op.insert.length - (op.to - op.from); continue }
+      if (op.from < base) return op.from + delta + op.insert.length
+      break
+    }
+    return base + delta
+  }
+  const toBase = (draft: number) => {
+    let delta = 0
+    for (const op of asc) {
+      const newFrom = op.from + delta
+      const newTo = newFrom + op.insert.length
+      if (draft >= newTo) { delta += op.insert.length - (op.to - op.from); continue }
+      if (draft >= newFrom) return op.from
+      break
+    }
+    return draft - delta
+  }
+  let out = text
+  for (const op of [...ops].sort((a, b) => b.from - a.from)) {
+    out = out.slice(0, op.from) + op.insert + out.slice(op.to)
+  }
+  return { text: out, toDraft, toBase }
+}
+
 type Props = {
   /** 源 EPUB 文件的绝对路径（book_dir/id/source.epub 或 history path） */
   epubPath: string
@@ -287,6 +452,10 @@ type Props = {
   initialHref?: string
   /** 阅读器当前所在顶层段落块序号（body.children 下标） */
   initialBlock?: number
+  /** 从阅读页送进来的划词译文：打开后直接替换到指定段落，变成可编辑草稿 */
+  pendingTranslation?: { href?: string; blockIndex?: number; translation: string }
+  /** 编辑器当前位置回报给外层（切到锻造档时用来对齐同章同段） */
+  onContext?: (ctx: { relPath?: string; blockIndex?: number }) => void
   onClose: () => void
   onNotify: (msg: string) => void
   /** 有未保存改动时同步给外层，用于切回阅读模式前确认 */
@@ -300,6 +469,33 @@ type Props = {
   createRevision?: boolean
   /** 翻译三通道通道 3：用于 translateConfigFromPrefs；不传时用默认值 */
   prefs?: Prefs
+  /** 嵌入阅读器统一壳：隐藏自带头部（返回/关闭/标题），标签与操作并成一行 */
+  embedded?: boolean
+  /** 把工具栏状态交给外层（嵌入时阅读器顶栏渲染唯一的按钮行） */
+  onToolbar?: (state: EditToolbarState | null) => void
+}
+
+export type EditTab = 'blocks' | 'meta' | 'toc'
+
+/** 段落视图三态：富文本 / 源码 / 分屏对照（原「源码视图」切面已合并到这里） */
+export type BlockView = 'rich' | 'source' | 'split'
+
+export type EditToolbarState = {
+  tab: EditTab
+  setTab: (tab: EditTab) => void
+  dirty: boolean
+  saving: boolean
+  checking: boolean
+  hasWorkspace: boolean
+  treeOpen: boolean
+  toggleTree: () => void
+  actions: {
+    history: () => void
+    write: () => void
+    save: () => void
+    saveAs: () => void
+    check: () => void
+  }
 }
 
 const ROLE_LABELS: Record<string, string> = {
@@ -323,6 +519,17 @@ function groupByRole(entries: EntryInfo[]) {
 }
 
 function baseName(p: string) { return p.split(/[\\/]/).pop() ?? p }
+
+/** 从 fromRel 所在目录计算到 toRel 的相对路径（EPUB 内图片引用用） */
+function relativePath(fromRel: string, toRel: string): string {
+  const from = fromRel.replace(/\\/g, '/').split('/')
+  const to = toRel.replace(/\\/g, '/').split('/')
+  from.pop()
+  let shared = 0
+  while (shared < from.length && shared < to.length - 1 && from[shared] === to[shared]) shared += 1
+  const up = from.length - shared
+  return [...Array(up).fill('..'), ...to.slice(shared)].join('/')
+}
 
 /** 把阅读器给的 href（相对 OPF，如 text/ch1.xhtml）对上 zip 内的完整路径 */
 function findEntryByHref(entries: EntryInfo[], href?: string): EntryInfo | null {
@@ -348,6 +555,15 @@ function formatBytes(bytes: number) {
 
 function clamp(n: number, lo: number, hi: number) { return Math.max(lo, Math.min(hi, n)) }
 
+/** 段落块纯文本：用于和阅读层划词草稿记录的 blockText 比对（图片占位不算文字） */
+function blockPlainText(html: string): string {
+  const doc = new DOMParser().parseFromString(`<div>${html}</div>`, 'text/html')
+  return (doc.body.textContent ?? '')
+    .replace(/［(?:图片|图形)］/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 function ScanGroup({ title, items }: { title: string; items: string[] }) {
   return (
     <div className="toc-scan__group">
@@ -360,9 +576,10 @@ function ScanGroup({ title, items }: { title: string; items: string[] }) {
 }
 
 export default function EpubEditPanel({
-  epubPath, bookId, exportDir, initialHref, initialBlock, onClose, onNotify, onDirtyChange, onCommitted,
+  epubPath, bookId, exportDir, initialHref, initialBlock, pendingTranslation, onContext,
+  onClose, onNotify, onDirtyChange, onCommitted,
   initialBlockFont = 15, initialSrcFont = 12, autoRebuild = true, createRevision = true,
-  prefs = DEFAULT_PREFS,
+  prefs = DEFAULT_PREFS, embedded = false, onToolbar,
 }: Props) {
   const [workspace, setWorkspace] = useState<EditWorkspace | null>(null)
   const [entries, setEntries] = useState<EntryInfo[]>([])
@@ -375,7 +592,9 @@ export default function EpubEditPanel({
   const [error, setError] = useState('')
 
   /** 编辑视图分档：源码 / 段落（块级编辑雏形）/ 元数据 / 目录 */
-  const [tab, setTab] = useState<'source' | 'blocks' | 'meta' | 'toc'>('blocks')
+  const [tab, setTab] = useState<EditTab>('blocks')
+  /** 文件树默认收起，需要时从顶栏点开（段落视图更省横向空间） */
+  const [treeOpen, setTreeOpen] = useState(false)
 
   // ─── 编辑区字号（Ctrl+滚轮） ───
   const [srcFont, setSrcFont] = useState(initialSrcFont)
@@ -397,6 +616,10 @@ export default function EpubEditPanel({
   const [scan, setScan] = useState<ScanReport | null>(null)
   const [renaming, setRenaming] = useState('')
   const [renameValue, setRenameValue] = useState('')
+  /** S9：文件级操作（新建 / 重命名 / 移动）的内联表单 */
+  const [fileOp, setFileOp] = useState<{ kind: FileOpKind; value: string; title?: string } | null>(null)
+  /** S9：执行前的影响面确认 */
+  const [pendingFileOp, setPendingFileOp] = useState<PendingFileOp | null>(null)
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [lastSelected, setLastSelected] = useState<string | null>(null)
@@ -416,20 +639,82 @@ export default function EpubEditPanel({
   const [blockDirty, setBlockDirty] = useState(false)
   const [blockVersion, setBlockVersion] = useState(0)
   const blockEdits = useRef<Record<number, string>>({})
+  /** D：新建块的真实内容（按 id 存 ref，避免受控 innerHTML 打断光标） */
+  const insertHtmlRef = useRef<Record<number, string>>({})
   /** 源码被手动改过、块坐标可能失效（此时禁止应用段落改动） */
   const [blocksStale, setBlocksStale] = useState(false)
   /** 已标记删除的块（写回时整段移除） */
   const [deletedIdx, setDeletedIdx] = useState<Set<number>>(new Set())
+
+  /** D：待插入的新块，key = 插在该段之后 */
+  const [inserts, setInserts] = useState<Record<number, InsertRow[]>>({})
+  const insertIdRef = useRef(1)
+  /** D：当前聚焦的新建块（内联工具条与上下移动都作用于它） */
+  const [activeInsert, setActiveInsert] = useState<{ anchor: number; id: number } | null>(null)
+  /** D：从 EPUB 现有图片里挑一张插入 */
+  const [imagePicker, setImagePicker] = useState(false)
+  /** D：新建块类型（段落 / 标题 / 空行） */
+  const [newBlockTag, setNewBlockTag] = useState('p')
+  /** E：段落视图撤销栈（Ctrl+Z / Ctrl+Shift+Z）；快照在改动前压栈 */
+  const historyRef = useRef<{ undo: BlockSnapshot[]; redo: BlockSnapshot[] }>({ undo: [], redo: [] })
+  const lastHistoryAtRef = useRef(0)
+  const [historyTick, setHistoryTick] = useState(0)
+  void historyTick
   /** 当前正在编辑的块序号（内联工具条作用于它） */
   const [activeBlock, setActiveBlock] = useState<number | null>(null)
   /** 通道 3：正在翻译的块序号（loading 状态） */
   const [translatingBlock, setTranslatingBlock] = useState<number | null>(null)
+  /** 逐块翻译失败原因（常驻，直到下次重试） */
+  const [translateError, setTranslateError] = useState<{ index: number; message: string } | null>(null)
+  /** 被翻译过的块 → 翻译前的原文 html，用于一键恢复原文 */
+  const [translatedOrigin, setTranslatedOrigin] = useState<Record<number, string>>({})
+  /** 术语表 / 翻译记忆：与锻造层共用应用数据目录里的同一份 */
+  const glossaryRef = useRef<GlossaryEntry[]>([])
+  const memoryRef = useRef<TranslationMemoryState>({ version: 1, entries: {} })
   const activeBlockRef = useRef<number | null>(null)
   activeBlockRef.current = activeBlock
-  /** 段落视图与源码并排（E4） */
-  const [splitOpen, setSplitOpen] = useState(true)
+  /** 段落视图三态（S8）：默认富文本，可切源码 / 分屏对照 */
+  const [blockView, setBlockView] = useState<BlockView>('rich')
+  /** 阅读层高亮 / 笔记（只读渲染到富文本视图，数据在 阅读壳/annotations.json） */
+  const [annotations, setAnnotations] = useState<Annotation[]>([])
+  /** 分屏时源码侧显示的镜像文本：富文本改动实时合入，仅本地预览、不落盘 */
+  const [mirrorText, setMirrorText] = useState<string | null>(null)
+  /** 源码侧光标所在块序号（富文本对应段高亮） */
+  const [srcActiveBlock, setSrcActiveBlock] = useState<number | null>(null)
+  /** 后端块区间（字节偏移，与 blocks 一一对应时才有值） */
+  const blockSpansRef = useRef<BlockInfo[] | null>(null)
+  /** 字节偏移 → JS 字符偏移缓存（换文件/文本变化即失效） */
+  const charSpansRef = useRef<{ text: string; spans: CharSpan[] } | null>(null)
+  /** 分屏镜像的偏移换算：镜像文本长度与原文不同时，靠它把两侧光标对齐 */
+  const mirrorOffsetRef = useRef<{ toDraft: (n: number) => number; toBase: (n: number) => number } | null>(null)
+  /** 程序化滚动期间短暂关闭双向滚动同步，避免互相拉扯 */
+  const scrollLockRef = useRef(0)
+  const blocksRef = useRef<BlockRow[] | null>(null)
+  blocksRef.current = blocks
+  const deletedRef = useRef(deletedIdx)
+  deletedRef.current = deletedIdx
+  const insertsRef = useRef(inserts)
+  insertsRef.current = inserts
+  const blocksStaleRef = useRef(blocksStale)
+  blocksStaleRef.current = blocksStale
+  const currentFileRef = useRef(currentFile)
+  currentFileRef.current = currentFile
   /** 阅读器带来的待滚动段落块序号（一次性） */
   const pendingBlockRef = useRef<number | null>(null)
+  /** 段落视图当前可见的顶层块序号（滚动时更新，供三档接力） */
+  const visibleBlockRef = useRef<number | null>(null)
+  /** 程序化定位期间暂停几何测量，避免把「上一段残影」当成当前段 */
+  const measureSuppressedRef = useRef(false)
+  /** 划词译文只应用一次（之后用户在段落里改动不回滚） */
+  const translationSeededRef = useRef(false)
+  /** 阅读层划词译文草稿（书级），用于切到编辑档时自动铺进对应段落 */
+  const draftsRef = useRef<TranslateDraftTable>({})
+  /** 草稿表变更计数：触发自动套用 effect 重跑 */
+  const [draftTick, setDraftTick] = useState(0)
+  /** 本次编辑会话里真正套用过的划词草稿；保存成功后清掉这些 */
+  const appliedDraftCfisRef = useRef<Set<string>>(new Set())
+  const onContextRef = useRef(onContext)
+  onContextRef.current = onContext
   const previewTimer = useRef<number | null>(null)
 
   // ─── E6：历史版本（EPUB 快照回滚） ───
@@ -437,7 +722,6 @@ export default function EpubEditPanel({
   const [revisions, setRevisions] = useState<EpubRevision[]>([])
   const [revBusy, setRevBusy] = useState(false)
 
-  const srcRef = useRef<HTMLTextAreaElement>(null)
   const tocListRef = useRef<HTMLDivElement>(null)
   const treeRef = useRef<HTMLElement>(null)
   const blockCanvasRef = useRef<HTMLDivElement>(null)
@@ -448,7 +732,34 @@ export default function EpubEditPanel({
     () => (tab === 'blocks' ? entries.filter((e) => e.role === 'text' || e.role === 'toc') : entries),
     [entries, tab],
   )
-  const visibleGroups = useMemo(() => groupByRole(visibleEntries), [visibleEntries])
+
+  /** 正文章节清单：nav 的 href 对到正文文件，按目录顺序排；缺标题的用文件名兜底 */
+  const chapterList = useMemo(() => {
+    const textFiles = entries.filter((e) => e.role === 'text')
+    const ordered: { entry: EntryInfo; label: string }[] = []
+    const seen = new Set<string>()
+    const walk = (nodes: TocNode[]) => {
+      for (const node of nodes) {
+        const hit = findEntryByHref(textFiles, node.href)
+        if (hit && !seen.has(hit.path)) {
+          seen.add(hit.path)
+          ordered.push({ entry: hit, label: (node.label ?? '').trim() })
+        }
+        walk(node.children)
+      }
+    }
+    walk(toc)
+    for (const entry of textFiles) {
+      if (!seen.has(entry.path)) ordered.push({ entry, label: '' })
+    }
+    return ordered
+  }, [entries, toc])
+
+  /** 结构文件：正文之外的分区（目录/样式/图片/字体/manifest） */
+  const structuralGroups = useMemo(
+    () => groupByRole(visibleEntries.filter((e) => e.role !== 'text')),
+    [visibleEntries],
+  )
 
   const metaDirty = !!workspace && (
     metaTitle !== workspace.metadata.title ||
@@ -460,6 +771,66 @@ export default function EpubEditPanel({
   useEffect(() => {
     onDirtyChange?.(dirty || metaDirty || blockDirty)
   }, [dirty, metaDirty, blockDirty, onDirtyChange])
+
+  // 翻译上下文与锻造层共用：进面板时读一次术语表与翻译记忆
+  useEffect(() => {
+    void (async () => {
+      try {
+        const [rawGlossary, rawMemory] = await Promise.all([
+          invoke<string>('read_glossary'),
+          invoke<string>('read_translation_memory'),
+        ])
+        glossaryRef.current = parseGlossary(rawGlossary)
+        memoryRef.current = parseMemory(rawMemory)
+      } catch (err) {
+        console.warn('读取术语表 / 翻译记忆失败：', err)
+      }
+    })()
+  }, [])
+
+  // 阅读层划词译文草稿：读入本书草稿表，编辑器打开章节后自动铺到对应段落
+  useEffect(() => {
+    if (!bookId) {
+      draftsRef.current = {}
+      return
+    }
+    let alive = true
+    const sync = (table: TranslateDraftTable) => {
+      draftsRef.current = table
+      setDraftTick(t => t + 1)
+    }
+    void loadBookDrafts(bookId).then(table => {
+      if (!alive) return
+      sync(table)
+    })
+    const unsubscribe = subscribeDrafts(bookId, table => {
+      if (!alive) return
+      sync(table)
+    })
+    return () => {
+      alive = false
+      unsubscribe()
+    }
+  }, [bookId])
+
+  // 阅读层高亮 / 笔记：进面板与换章时读一次，只读渲染，不在编辑档改
+  useEffect(() => {
+    if (!bookId) {
+      setAnnotations([])
+      return
+    }
+    let alive = true
+    void loadBookAnnotations(bookId)
+      .then(result => {
+        if (alive) setAnnotations(result.list)
+      })
+      .catch(() => {
+        if (alive) setAnnotations([])
+      })
+    return () => {
+      alive = false
+    }
+  }, [bookId, currentFile?.relPath])
 
   // ─── 把工作副本信息灌进表单 ───
 
@@ -601,8 +972,14 @@ export default function EpubEditPanel({
         editDir: workspace.editDir,
         outputPath: workspace.originPath,
         createRevision,
+        bookId,
       })
       setDirty(false)
+      // 译文已写进书里：清掉本次真正用到的阅读划词草稿，避免下次重复带入
+      if (bookId) {
+        for (const cfi of appliedDraftCfisRef.current) removeDraft(bookId, cfi)
+        appliedDraftCfisRef.current.clear()
+      }
       onNotify('已保存并重打包')
       onCommitted?.()
     } catch (err) {
@@ -610,7 +987,7 @@ export default function EpubEditPanel({
     } finally {
       setSaving(false)
     }
-  }, [workspace, currentFile, dirty, blockDirty, onNotify, onCommitted, createRevision])
+  }, [workspace, currentFile, dirty, blockDirty, bookId, onNotify, onCommitted, createRevision])
 
   // ─── 另存为（默认落到最终成品文件夹，可另选任意位置） ───
 
@@ -642,6 +1019,7 @@ export default function EpubEditPanel({
         editDir: workspace.editDir,
         outputPath: target,
         createRevision: false,
+        bookId,
       })
       onNotify(`已另存为：${target}`)
     } catch (err) {
@@ -649,7 +1027,7 @@ export default function EpubEditPanel({
     } finally {
       setSaving(false)
     }
-  }, [workspace, currentFile, dirty, blockDirty, exportDir, onNotify])
+  }, [workspace, currentFile, dirty, blockDirty, exportDir, bookId, onNotify])
 
   // ─── epubcheck ───
 
@@ -679,14 +1057,14 @@ export default function EpubEditPanel({
     setRevBusy(true)
     setError('')
     try {
-      const list = await invoke<EpubRevision[]>('edit_list_revisions', { editDir: workspace.editDir })
+      const list = await invoke<EpubRevision[]>('edit_list_revisions', { editDir: workspace.editDir, bookId })
       setRevisions(list)
     } catch (err) {
       setError(`读取历史版本失败：${String(err)}`)
     } finally {
       setRevBusy(false)
     }
-  }, [workspace])
+  }, [workspace, bookId])
 
   const handleRestore = useCallback(async (revision: EpubRevision) => {
     if (!workspace) return
@@ -699,6 +1077,7 @@ export default function EpubEditPanel({
         editDir: workspace.editDir,
         originPath: workspace.originPath,
         revision: revision.name,
+        bookId,
       })
       fillFromWorkspace(ws)
       blockEdits.current = {}
@@ -714,7 +1093,7 @@ export default function EpubEditPanel({
         })
         setCurrentFile(fresh)
       }
-      const list = await invoke<EpubRevision[]>('edit_list_revisions', { editDir: ws.editDir })
+      const list = await invoke<EpubRevision[]>('edit_list_revisions', { editDir: ws.editDir, bookId })
       setRevisions(list)
       onNotify(`已回滚到 ${label}`)
       onCommitted?.()
@@ -723,7 +1102,7 @@ export default function EpubEditPanel({
     } finally {
       setRevBusy(false)
     }
-  }, [workspace, currentFile, fillFromWorkspace, onNotify, onCommitted])
+  }, [workspace, currentFile, bookId, fillFromWorkspace, onNotify, onCommitted])
 
 
   // ─── E2：选封面图（只预览，保存时替换进工作副本） ───
@@ -787,10 +1166,15 @@ export default function EpubEditPanel({
     setDeletedIdx(new Set())
     setActiveBlock(null)
     setBlockError('')
+    blockSpansRef.current = null
+    charSpansRef.current = null
+    mirrorOffsetRef.current = null
+    setMirrorText(null)
+    setSrcActiveBlock(null)
     if (!currentFile?.text) { setBlocks(null); return }
     if (!/x?html?|xml/i.test(currentFile.mime) && !/\.(x?html?|xhtml)$/i.test(currentFile.relPath)) {
       setBlocks(null)
-      setBlockError('这个文件不是正文（样式 / 清单只在源码视图编辑）')
+      setBlockError('这个文件不是正文，已切到源码模式')
       return
     }
     try {
@@ -818,11 +1202,17 @@ export default function EpubEditPanel({
         const relPath = currentFile.relPath
         void invoke<BlockInfo[]>('edit_scan_blocks', { editDir, relPath })
           .then(list => {
-            if (cancelled || list.length === rows.length) return
-            setBlocks(null)
-            setBlockError(`段落索引与后端不一致（前端 ${rows.length} / 后端 ${list.length}），请点「刷新预览」`)
+            if (cancelled) return
+            if (list.length !== rows.length) {
+              setBlocks(null)
+              setBlockError(`段落索引与后端不一致（前端 ${rows.length} / 后端 ${list.length}），请点「刷新预览」`)
+              return
+            }
+            // 后端区间是 UTF-8 字节偏移；分屏镜像与光标对应都要用字符下标
+            blockSpansRef.current = list
+            charSpansRef.current = null
           })
-          .catch(() => { /* 后端不可用时以 DOM 解析结果为准 */ })
+          .catch(() => { /* 后端不可用时以 DOM 解析结果为准（分屏镜像降级为只读源码） */ })
       }
     } catch (err) {
       setBlocks(null)
@@ -868,33 +1258,82 @@ export default function EpubEditPanel({
         if (tagChanged) edit.tag = row.tag
         payload.push(edit)
       })
-      if (!payload.length) return false
+
+      // D：新建块——内容来自 ref（避免受控 innerHTML 打断光标）
+      const insertPayload: { index: number; tag: string; inner: string }[] = []
+      for (const [anchor, list] of Object.entries(inserts)) {
+        const anchorIndex = Number(anchor)
+        if (deletedIdx.has(anchorIndex)) continue
+        for (const row of list) {
+          const rawHtml = insertHtmlRef.current[row.id] ?? row.html
+          const clean = sanitizeInline(normalizeBlockBreaks(rawHtml))
+          insertPayload.push({ index: anchorIndex, tag: row.tag, inner: clean.xml })
+        }
+      }
+      if (!payload.length && !insertPayload.length) return false
 
       const result = await invoke<BlockWriteResult>('edit_write_blocks', {
         editDir: workspace.editDir,
         relPath: currentFile.relPath,
         edits: payload,
+        inserts: insertPayload,
       })
       const fresh = await invoke<FileContent>('edit_read_file', {
         editDir: workspace.editDir, relPath: currentFile.relPath,
       })
       setCurrentFile(fresh)
       blockEdits.current = {}
+      insertHtmlRef.current = {}
+      setInserts({})
+      setActiveInsert(null)
+      // 写回后块坐标已变，旧快照作废
+      historyRef.current = { undo: [], redo: [] }
       setBlockDirty(false)
       setDeletedIdx(new Set())
       setDirty(false)
       setBlockVersion(v => v + 1)
 
+      // P3：人工确认写回的译文才进翻译记忆；阅读划词草稿不进
+      let memory = memoryRef.current
+      let memoryChanged = false
+      const confirmed: number[] = []
+      for (const edit of payload) {
+        const origin = translatedOrigin[edit.index]
+        if (origin === undefined) continue
+        confirmed.push(edit.index)
+        if (typeof edit.inner !== 'string') continue
+        const source = blockPlainText(origin)
+        const target = blockPlainText(edit.inner)
+        if (!source || !target || source === target) continue
+        const next = rememberTranslation(memory, source, target, 'edit')
+        if (next !== memory) {
+          memory = next
+          memoryChanged = true
+        }
+      }
+      if (memoryChanged) {
+        memoryRef.current = memory
+        void invoke('write_translation_memory', { json: serializeMemory(memory) })
+          .catch(err => console.warn('写入翻译记忆失败：', err))
+      }
+      if (confirmed.length) {
+        setTranslatedOrigin(prev => {
+          const next = { ...prev }
+          confirmed.forEach(idx => { delete next[idx] })
+          return next
+        })
+      }
+
       const stripNote = removedTags.length || removedAttrs.length
         ? `，已剥离 ${removedTags.length} 个标签 / ${removedAttrs.length} 个属性`
         : ''
-      onNotify(`已写回 ${result.replaced} 段${result.deleted ? `、删除 ${result.deleted} 段` : ''}；其余 ${result.total - result.replaced - result.deleted} 段逐字节保留${stripNote}`)
+      onNotify(`已写回 ${result.replaced} 段${result.deleted ? `、删除 ${result.deleted} 段` : ''}${result.inserted ? `、新增 ${result.inserted} 段` : ''}；其余 ${result.total - result.replaced - result.deleted} 段逐字节保留${stripNote}`)
       return true
     } catch (err) {
       setError(`段落写回失败：${String(err)}`)
       return false
     }
-  }, [workspace, currentFile, blocks, blocksStale, deletedIdx, onNotify])
+  }, [workspace, currentFile, blocks, blocksStale, deletedIdx, inserts, translatedOrigin, onNotify])
   applyBlocksRef.current = applyBlocks
 
   /** 段落内粘贴：走白名单过滤，危险标签剥离并提示 */
@@ -986,21 +1425,318 @@ export default function EpubEditPanel({
     setBlockDirty(true)
   }, [])
 
+  // ─── E：段落视图撤销 / 重做（快照在改动前压栈） ───
+
+  const snapshotNow = useCallback((): BlockSnapshot => {
+    const copyInserts: Record<number, InsertRow[]> = {}
+    for (const [anchor, list] of Object.entries(inserts)) {
+      copyInserts[Number(anchor)] = list.map(row => ({
+        ...row,
+        html: insertHtmlRef.current[row.id] ?? row.html,
+      }))
+    }
+    return {
+      rows: (blocks ?? []).map(row => ({ html: row.html, tag: row.tag })),
+      deleted: [...deletedIdx],
+      edits: { ...blockEdits.current },
+      inserts: copyInserts,
+    }
+  }, [blocks, deletedIdx, inserts])
+
+  const pushHistory = useCallback(() => {
+    if (!blocks) return
+    const history = historyRef.current
+    history.undo.push(snapshotNow())
+    if (history.undo.length > 60) history.undo.shift()
+    history.redo = []
+    lastHistoryAtRef.current = Date.now()
+    setHistoryTick(n => n + 1)
+  }, [blocks, snapshotNow])
+
+  const applySnapshot = useCallback((snap: BlockSnapshot) => {
+    blockEdits.current = { ...snap.edits }
+    setBlocks(prev => prev ? prev.map((row, i) => ({
+      ...row,
+      html: snap.rows[i]?.html ?? row.html,
+      tag: snap.rows[i]?.tag ?? row.tag,
+    })) : prev)
+    setDeletedIdx(new Set(snap.deleted))
+    const nextInserts: Record<number, InsertRow[]> = {}
+    const nextHtml: Record<number, string> = {}
+    for (const [anchor, list] of Object.entries(snap.inserts)) {
+      nextInserts[Number(anchor)] = list.map(row => {
+        nextHtml[row.id] = row.html
+        return { ...row }
+      })
+    }
+    insertHtmlRef.current = nextHtml
+    setInserts(nextInserts)
+    setBlockDirty(true)
+  }, [])
+
+  const undoBlocks = useCallback(() => {
+    const history = historyRef.current
+    const prev = history.undo.pop()
+    if (!prev) { onNotify('没有可撤销的段落改动'); return }
+    history.redo.push(snapshotNow())
+    applySnapshot(prev)
+    setHistoryTick(n => n + 1)
+  }, [applySnapshot, onNotify, snapshotNow])
+
+  const redoBlocks = useCallback(() => {
+    const history = historyRef.current
+    const next = history.redo.pop()
+    if (!next) { onNotify('没有可重做的段落改动'); return }
+    history.undo.push(snapshotNow())
+    applySnapshot(next)
+    setHistoryTick(n => n + 1)
+  }, [applySnapshot, onNotify, snapshotNow])
+
+  /** D：新建块的锚点（优先当前聚焦段，否则插在最后一段之后） */
+  const insertAnchor = useCallback((): number => {
+    if (activeBlock != null) return activeBlock
+    return Math.max(0, (blocks?.length ?? 1) - 1)
+  }, [activeBlock, blocks])
+
+  const addBlock = useCallback((tag: string, html = '') => {
+    if (!blocks?.length) { onNotify('这个文件没有可分块的正文'); return }
+    pushHistory()
+    const anchor = insertAnchor()
+    const id = insertIdRef.current++
+    insertHtmlRef.current[id] = html
+    const row: InsertRow = { id, tag, html }
+    setInserts(prev => ({ ...prev, [anchor]: [...(prev[anchor] ?? []), row] }))
+    setActiveInsert({ anchor, id })
+    setActiveBlock(null)
+    setBlockDirty(true)
+  }, [blocks, insertAnchor, onNotify, pushHistory])
+
+  const updateInsert = useCallback((id: number, html: string) => {
+    insertHtmlRef.current[id] = html
+    if (!blockDirty) setBlockDirty(true)
+  }, [blockDirty])
+
+  const removeInsert = useCallback((anchor: number, id: number) => {
+    pushHistory()
+    delete insertHtmlRef.current[id]
+    setInserts(prev => {
+      const list = (prev[anchor] ?? []).filter(row => row.id !== id)
+      const next = { ...prev }
+      if (list.length) next[anchor] = list
+      else delete next[anchor]
+      return next
+    })
+    setActiveInsert(cur => (cur && cur.id === id ? null : cur))
+    setBlockDirty(true)
+  }, [pushHistory])
+
+  /** D：整段上移 / 下移（交换相邻两段的内容与标签；原块的 class/id 留在原位） */
+  const moveBlock = useCallback((index: number, delta: -1 | 1) => {
+    if (!blocks) return
+    const target = index + delta
+    if (target < 0 || target >= blocks.length) return
+    if (deletedIdx.has(index) || deletedIdx.has(target)) {
+      onNotify('相邻段带有删除标记，请先撤销删除再移动')
+      return
+    }
+    pushHistory()
+    const a = blocks[index]
+    const b = blocks[target]
+    const editA = blockEdits.current[index] ?? a.html
+    const editB = blockEdits.current[target] ?? b.html
+    blockEdits.current[index] = editB
+    blockEdits.current[target] = editA
+    setBlocks(prev => prev ? prev.map((row, i) => {
+      if (i === index) return { ...row, html: b.html, tag: b.tag }
+      if (i === target) return { ...row, html: a.html, tag: a.tag }
+      return row
+    }) : prev)
+    setBlockDirty(true)
+  }, [blocks, deletedIdx, onNotify, pushHistory])
+
+  const handleUnderline = useCallback(() => runInline('underline'), [runInline])
+
+  /** D：从 EPUB 现有图片里插入一张到当前段 */
+  const imageEntries = useMemo(
+    () => entries.filter(e => e.mediaType.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/i.test(e.path)),
+    [entries],
+  )
+
+  const insertImage = useCallback((entry: EntryInfo) => {
+    const index = activeBlockRef.current
+    if (index == null) {
+      onNotify('先把光标放到要插图的那一段')
+      return
+    }
+    const host = blockPageRef.current
+      ?.querySelector(`[data-blk-index="${index}"] .blk-body`) as HTMLElement | null
+    if (!host) return
+    const focused = document.activeElement
+    if (focused !== host && !host.contains(focused)) {
+      onNotify('先把光标放到这一段正文里')
+      return
+    }
+    if (!currentFile) return
+    const src = relativePath(currentFile.relPath, entry.path)
+    document.execCommand('insertHTML', false, `<img src="${src}" alt="${baseName(entry.path)}"/>`)
+    blockEdits.current[index] = host.innerHTML
+    setBlockDirty(true)
+    setImagePicker(false)
+    onNotify(`已插入图片 ${baseName(entry.path)}，应用改动后写入章节`)
+  }, [currentFile, onNotify])
+
   /** E4：源码 → 预览重解析；段落有未应用改动时需要先确认 */
   const rebuildPreview = useCallback(() => {
     if (blockDirty && !confirm('段落里有尚未应用的改动，刷新预览会丢弃它们，继续？')) return
     setBlockVersion(v => v + 1)
   }, [blockDirty])
 
-  /** E4：并排源码框打字后，停顿 700ms 自动重建预览（设置里可关闭） */
+  /** E4：源码侧打字后，停顿 700ms 自动重建预览（设置里可关闭） */
   const handleSplitSourceChange = useCallback((value: string) => {
     handleTextChange(value)
+    mirrorOffsetRef.current = null
+    setMirrorText(null)
     if (previewTimer.current) window.clearTimeout(previewTimer.current)
     // 源码改过之后块坐标不再可靠，标脏并停止自动重建
     if (blockDirty) { setBlocksStale(true); return }
     if (!autoRebuild) return
     previewTimer.current = window.setTimeout(() => setBlockVersion(v => v + 1), 700)
   }, [handleTextChange, blockDirty, autoRebuild])
+
+  /** 字节偏移映射缓存：同一份源码文本只算一次 */
+  const charSpansFor = useCallback((text: string, spans: BlockInfo[]): CharSpan[] => {
+    const cached = charSpansRef.current
+    if (cached && cached.text === text) return cached.spans
+    const computed = toCharSpans(text, spans)
+    charSpansRef.current = { text, spans: computed }
+    return computed
+  }, [])
+
+  /** 富文本实时改动 → 源码镜像（不写盘；源码已被手动改动时降级为原文） */
+  const buildMirror = useCallback(() => {
+    const file = currentFileRef.current
+    const rows = blocksRef.current
+    const spans = blockSpansRef.current
+    if (!file?.text || !rows?.length || !spans || blocksStaleRef.current) {
+      mirrorOffsetRef.current = null
+      setMirrorText(null)
+      return
+    }
+    const composed = composeBlockDraft(
+      file.text,
+      charSpansFor(file.text, spans),
+      rows,
+      blockEdits.current,
+      deletedRef.current,
+      insertsRef.current,
+      insertHtmlRef.current,
+    )
+    // 没有实际改动时回到受控原文，避免无意义的整章重渲染
+    if (composed.text === file.text) {
+      mirrorOffsetRef.current = null
+      setMirrorText(null)
+    } else {
+      mirrorOffsetRef.current = { toDraft: composed.toDraft, toBase: composed.toBase }
+      setMirrorText(composed.text)
+    }
+  }, [charSpansFor])
+
+  // 分屏对照：监听富文本画布里的所有 DOM 变更（打字 / 加粗 / 粘贴 / 翻译 / 删除），
+  // 停顿 180ms 合入源码镜像，避免每敲一个字都重排整章。
+  useEffect(() => {
+    if (blockView !== 'split') return
+    const page = blockPageRef.current
+    if (!page) return
+    let timer = 0
+    const observer = new MutationObserver(() => {
+      if (timer) window.clearTimeout(timer)
+      timer = window.setTimeout(() => { timer = 0; buildMirror() }, 180)
+    })
+    observer.observe(page, { subtree: true, childList: true, characterData: true, attributes: true })
+    buildMirror()
+    return () => {
+      observer.disconnect()
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [blockView, currentFile?.relPath, blockVersion, blocks, buildMirror])
+
+  // 分屏对照：富文本侧聚焦某段 → 源码光标落到该段 innerStart 并滚到可见处
+  useEffect(() => {
+    if (blockView !== 'split' || activeBlock == null) return
+    const ta = splitSrcRef.current
+    const file = currentFileRef.current
+    const spans = blockSpansRef.current
+    if (!ta || !file?.text || !spans) return
+    if (document.activeElement === ta) return
+    const span = charSpansFor(file.text, spans)[activeBlock]
+    if (!span) return
+    const target = mirrorOffsetRef.current ? mirrorOffsetRef.current.toDraft(span.innerStart) : span.innerStart
+    ta.setSelectionRange(target, target)
+    const line = file.text.slice(0, span.innerStart).split('\n').length - 1
+    scrollLockRef.current = Date.now() + 150
+    ta.scrollTop = Math.max(0, line * blockFont * 1.9 - ta.clientHeight / 3)
+  }, [activeBlock, blockView, currentFile?.relPath, blockFont, charSpansFor])
+
+  // 分屏对照：源码光标移动到哪段，富文本就高亮并滚到对应段
+  const handleSourceCaret = useCallback(() => {
+    const ta = splitSrcRef.current
+    const file = currentFileRef.current
+    const spans = blockSpansRef.current
+    if (!ta || !file?.text || !spans) return
+    const chars = charSpansFor(file.text, spans)
+    const raw = ta.selectionStart
+    const pos = mirrorOffsetRef.current ? mirrorOffsetRef.current.toBase(raw) : raw
+    let idx = chars.findIndex(span => pos >= span.innerStart && pos <= span.innerEnd)
+    if (idx < 0) {
+      // 光标落在段落之间的空白（或镜像文本比原文长导致的偏移）时，归到前一个块
+      for (let k = chars.length - 1; k >= 0; k -= 1) {
+        if (pos >= chars[k].start) { idx = k; break }
+      }
+    }
+    if (idx < 0) return
+    setSrcActiveBlock(idx)
+    const canvas = blockCanvasRef.current
+    const page = blockPageRef.current
+    if (!canvas || !page) return
+    const el = page.querySelector(`[data-blk-index="${idx}"]`) as HTMLElement | null
+    if (!el) return
+    const top = el.getBoundingClientRect().top - canvas.getBoundingClientRect().top + canvas.scrollTop - 24
+    if (top < canvas.scrollTop || top + el.offsetHeight > canvas.scrollTop + canvas.clientHeight) {
+      scrollLockRef.current = Date.now() + 160
+      canvas.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+    }
+  }, [charSpansFor])
+
+  // 分屏对照：左右按滚动比例双向联动（短时锁避免互相拉扯）
+  useEffect(() => {
+    if (blockView !== 'split') return
+    const canvas = blockCanvasRef.current
+    const ta = splitSrcRef.current
+    if (!canvas || !ta) return
+    // 进入分屏时先把源码侧对齐到富文本当前滚动位置
+    const startSrcMax = canvas.scrollHeight - canvas.clientHeight
+    const startDstMax = ta.scrollHeight - ta.clientHeight
+    if (startSrcMax > 0 && startDstMax > 0 && canvas.scrollTop > 0) {
+      scrollLockRef.current = Date.now() + 140
+      ta.scrollTop = (canvas.scrollTop / startSrcMax) * startDstMax
+    }
+    const sync = (src: HTMLElement, dst: HTMLElement) => {
+      if (Date.now() < scrollLockRef.current) return
+      const srcMax = src.scrollHeight - src.clientHeight
+      const dstMax = dst.scrollHeight - dst.clientHeight
+      if (srcMax <= 0 || dstMax <= 0) return
+      scrollLockRef.current = Date.now() + 60
+      dst.scrollTop = (src.scrollTop / srcMax) * dstMax
+    }
+    const onCanvas = () => sync(canvas, ta)
+    const onSource = () => sync(ta, canvas)
+    canvas.addEventListener('scroll', onCanvas, { passive: true })
+    ta.addEventListener('scroll', onSource, { passive: true })
+    return () => {
+      canvas.removeEventListener('scroll', onCanvas)
+      ta.removeEventListener('scroll', onSource)
+    }
+  }, [blockView, currentFile?.relPath, blockVersion])
 
   useEffect(() => () => {
     if (previewTimer.current) window.clearTimeout(previewTimer.current)
@@ -1017,11 +1753,128 @@ export default function EpubEditPanel({
     if (!canvas || !page) return
     const el = page.children[idx] as HTMLElement | undefined
     if (!el) return
+    // 定位的目标段就是当前段；几何测量等重排稳定后再接管
+    visibleBlockRef.current = idx
+    measureSuppressedRef.current = true
+    window.setTimeout(() => { measureSuppressedRef.current = false }, 1500)
     const top = el.getBoundingClientRect().top - canvas.getBoundingClientRect().top + canvas.scrollTop - 16
     canvas.scrollTop = Math.max(0, top)
     el.classList.add('blk-focus')
     window.setTimeout(() => el.classList.remove('blk-focus'), 1600)
   }, [blocks])
+
+  // ─── 位置回报：当前文件 / 当前段落变化时同步给外层，供三档接力 ───
+
+  useEffect(() => {
+    if (!currentFile) return
+    const blockIndex = activeBlock
+      ?? visibleBlockRef.current
+      ?? (typeof initialBlock === 'number' ? initialBlock : undefined)
+    onContextRef.current?.({ relPath: currentFile.relPath, blockIndex })
+  }, [currentFile, activeBlock])
+
+  // 段落视图滚动时记录当前可见块：切到锻造档按它对齐同一段
+  useEffect(() => {
+    const canvas = blockCanvasRef.current
+    const page = blockPageRef.current
+    const relPath = currentFile?.relPath
+    if (!canvas || !page || !relPath) return
+    let raf = 0
+    const measure = () => {
+      raf = 0
+      if (measureSuppressedRef.current) return
+      const top = canvas.getBoundingClientRect().top + 8
+      let best = 0
+      // 取视口顶部正在阅读的那一段：最后一个顶边越过视口顶的块
+      for (let i = 0; i < page.children.length; i += 1) {
+        if (page.children[i].getBoundingClientRect().top <= top) best = i
+        else break
+      }
+      visibleBlockRef.current = best
+      onContextRef.current?.({ relPath, blockIndex: best })
+    }
+    const onScroll = () => {
+      if (!raf) raf = requestAnimationFrame(measure)
+    }
+    canvas.addEventListener('scroll', onScroll, { passive: true })
+    measure()
+    return () => {
+      canvas.removeEventListener('scroll', onScroll)
+      if (raf) cancelAnimationFrame(raf)
+    }
+  }, [blocks, currentFile?.relPath])
+
+  // ─── 划词译文送进编辑：段落视图就绪后替换到目标段落，变成可编辑草稿 ───
+
+  useEffect(() => {
+    if (translationSeededRef.current || !pendingTranslation || !blocks) return
+    translationSeededRef.current = true
+    const idx = typeof pendingTranslation.blockIndex === 'number'
+      ? pendingTranslation.blockIndex
+      : (typeof initialBlock === 'number' ? initialBlock : null)
+    if (idx == null || !blocks[idx]) {
+      onNotify('没能定位到原文段落：已定位到章节，请在段落视图里手动选择要替换的段')
+      return
+    }
+    const sanitized = sanitizeInline(pendingTranslation.translation)
+    const beforeHtml = blockEdits.current[idx] ?? blocks[idx].html
+    setTranslatedOrigin(prev => (prev[idx] ? prev : { ...prev, [idx]: beforeHtml }))
+    blockEdits.current[idx] = sanitized.xml
+    setBlocks(prev => prev
+      ? prev.map((row, i) => (i === idx ? { ...row, html: sanitized.xml } : row))
+      : prev)
+    setBlockDirty(true)
+    setActiveBlock(idx)
+    pendingBlockRef.current = idx
+    onNotify('已把划词译文放进该段，可直接修改；应用改动后写回')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingTranslation, blocks])
+
+  // ─── 阅读时的划词译文草稿：打开章节后自动铺进对应段落，成为可编辑草稿 ───
+
+  useEffect(() => {
+    if (!bookId || !currentFile || !blocks) return
+    const relPath = currentFile.relPath
+    const pendingIdx = typeof pendingTranslation?.blockIndex === 'number'
+      ? pendingTranslation.blockIndex
+      : null
+    const nextEdits: Record<number, string> = {}
+    const nextOrigins: Record<number, string> = {}
+    const nextCfis: string[] = []
+    for (const draft of Object.values(draftsRef.current)) {
+      if (!samePath(draft.relPath, relPath)) continue
+      const idx = draft.block
+      if (typeof idx !== 'number' || !blocks[idx]) continue
+      // 已送进编辑的那段由主流程接管，不重复覆盖
+      if (pendingIdx === idx) continue
+      if (blockEdits.current[idx] !== undefined || translatedOrigin[idx] !== undefined) continue
+      // 原文校验：块文字已被改过就不再自动套用，避免覆盖人工改动
+      const current = blockPlainText(blocks[idx].html)
+      const expected = (draft.blockText ?? '').replace(/\s+/g, ' ').trim()
+      if (!current) continue
+      if (expected) {
+        if (current !== expected) continue
+      } else {
+        const snippet = draft.text.replace(/\s+/g, ' ').trim().slice(0, 16)
+        if (!snippet || !current.includes(snippet)) continue
+      }
+      const sanitized = sanitizeInline(draft.translation)
+      nextOrigins[idx] = blocks[idx].html
+      nextEdits[idx] = sanitized.xml
+      nextCfis.push(draft.cfi)
+    }
+    const applied = Object.keys(nextEdits).length
+    if (!applied) return
+    nextCfis.forEach(cfi => appliedDraftCfisRef.current.add(cfi))
+    Object.assign(blockEdits.current, nextEdits)
+    setTranslatedOrigin(prev => ({ ...prev, ...nextOrigins }))
+    setBlocks(prev => prev
+      ? prev.map((row, i) => (nextEdits[i] !== undefined ? { ...row, html: nextEdits[i] } : row))
+      : prev)
+    setBlockDirty(true)
+    onNotify(`已带入 ${applied} 段阅读时的译文草稿，可直接修改；保存后写回本书`)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocks, currentFile?.relPath, draftTick])
 
   // ─── 文件树跟随当前文件（自动定位时不把高亮项留在视口外） ───
 
@@ -1037,19 +1890,6 @@ export default function EpubEditPanel({
   }, [currentFile?.relPath])
 
   // ─── Ctrl+滚轮字号（源码框 / 目录条目框，各自独立） ───
-
-  useEffect(() => {
-    const el = srcRef.current
-    if (!el) return
-    const onWheel = (e: WheelEvent) => {
-      if (!e.ctrlKey && !e.metaKey) return
-      e.preventDefault()
-      e.stopPropagation()
-      setSrcFont(f => clamp(f + (e.deltaY > 0 ? -1 : 1), 9, 28))
-    }
-    el.addEventListener('wheel', onWheel, { passive: false })
-    return () => el.removeEventListener('wheel', onWheel)
-  }, [tab, currentFile?.relPath])
 
   useEffect(() => {
     const el = tocListRef.current
@@ -1075,7 +1915,7 @@ export default function EpubEditPanel({
     }
     el.addEventListener('wheel', onWheel, { passive: false })
     return () => el.removeEventListener('wheel', onWheel)
-  }, [tab, currentFile?.relPath, splitOpen])
+  }, [tab, currentFile?.relPath, blockView])
 
   useEffect(() => {
     const el = splitSrcRef.current
@@ -1084,11 +1924,13 @@ export default function EpubEditPanel({
       if (!e.ctrlKey && !e.metaKey) return
       e.preventDefault()
       e.stopPropagation()
-      setSrcFont(f => clamp(f + (e.deltaY > 0 ? -1 : 1), 9, 28))
+      // 正文文件的源码框与富文本共用字号，保证分屏两侧大小接近
+      if (blocksRef.current?.length) setBlockFont(f => clamp(f + (e.deltaY > 0 ? -1 : 1), 11, 34))
+      else setSrcFont(f => clamp(f + (e.deltaY > 0 ? -1 : 1), 9, 28))
     }
     el.addEventListener('wheel', onWheel, { passive: false })
     return () => el.removeEventListener('wheel', onWheel)
-  }, [tab, currentFile?.relPath, splitOpen])
+  }, [tab, currentFile?.relPath, blockView])
 
   // ─── E3：目录树编辑 ───
 
@@ -1248,6 +2090,138 @@ export default function EpubEditPanel({
     }
   }, [workspace, onNotify])
 
+  // ─── S9：文件级操作（新建 / 重命名 / 移动 / 删除） ───
+
+  /** 操作后刷新文件树与目录，必要时重新打开文件（删除则清空） */
+  const refreshFiles = useCallback(async (focus?: string) => {
+    if (!workspace) return
+    const [list, doc] = await Promise.all([
+      invoke<EntryInfo[]>('edit_list_files', { editDir: workspace.editDir }),
+      invoke<TocDocument>('edit_read_toc', { editDir: workspace.editDir, opfPath: workspace.opfPath }),
+    ])
+    setEntries(list)
+    setWorkspace(w => (w ? { ...w, entries: list } : w))
+    setToc(doc.tree)
+    setTocIssues(doc.issues)
+    if (focus) {
+      const hit = list.find(e => e.path === focus)
+      if (hit) {
+        const content = await invoke<FileContent>('edit_read_file', {
+          editDir: workspace.editDir, relPath: hit.path,
+        })
+        setCurrentFile(content)
+        setDirty(false)
+        setBlockDirty(false)
+      }
+    } else if (currentFile && !list.some(e => e.path === currentFile.relPath)) {
+      setCurrentFile(null)
+      setDirty(false)
+      setBlockDirty(false)
+    }
+  }, [workspace, currentFile])
+
+  const startFileOp = (kind: FileOpKind) => {
+    if (!workspace) return
+    if (dirty || blockDirty) {
+      onNotify('当前文件有未保存改动，请先保存再做文件级操作')
+      return
+    }
+    if (kind !== 'create' && !currentFile) {
+      onNotify('先在文件树里选一个文件')
+      return
+    }
+    setError('')
+    setPendingFileOp(null)
+    const dir = currentFile && currentFile.relPath.includes('/')
+      ? currentFile.relPath.slice(0, currentFile.relPath.lastIndexOf('/'))
+      : ''
+    setFileOp({
+      kind,
+      value: kind === 'create'
+        ? (dir ? `${dir}/chapter-new.xhtml` : 'chapter-new.xhtml')
+        : kind === 'rename' ? baseName(currentFile!.relPath) : currentFile!.relPath,
+      title: kind === 'create' ? '新章节' : undefined,
+    })
+  }
+
+  const submitFileOp = useCallback(async () => {
+    if (!workspace || !fileOp || !currentFile && fileOp.kind !== 'create') return
+    const value = fileOp.value.trim()
+    if (!value) { setError('文件名不能为空'); return }
+    setTocBusy(true); setError('')
+    try {
+      if (fileOp.kind === 'create') {
+        const r = await invoke<FileOpResult>('edit_create_chapter', {
+          editDir: workspace.editDir, opfPath: workspace.opfPath,
+          relPath: value, title: fileOp.title ?? '',
+        })
+        setFileOp(null)
+        await refreshFiles(r.relPath)
+        onNotify(`已新建章节 ${r.relPath}（manifest ${r.addedManifest ? '✓' : '×'} / spine ${r.addedSpine ? '✓' : '×'} / 目录 ${r.addedToc ? '✓' : '×'}）`)
+        return
+      }
+      const from = currentFile!.relPath
+      const to = fileOp.kind === 'rename'
+        ? (from.includes('/') ? `${from.slice(0, from.lastIndexOf('/'))}/${value}` : value)
+        : value
+      if (to === from) { setFileOp(null); return }
+      const impact = await invoke<FileImpact>('edit_file_impact', {
+        editDir: workspace.editDir, opfPath: workspace.opfPath, relPath: from,
+      })
+      setPendingFileOp({ kind: fileOp.kind, from, to, impact })
+      setFileOp(null)
+    } catch (err) {
+      setError(`文件操作失败：${String(err)}`)
+    } finally {
+      setTocBusy(false)
+    }
+  }, [workspace, fileOp, currentFile, refreshFiles, onNotify])
+
+  const askDeleteFile = useCallback(async () => {
+    if (!workspace || !currentFile) { onNotify('先在文件树里选一个文件'); return }
+    if (dirty || blockDirty) { onNotify('当前文件有未保存改动，请先保存'); return }
+    setTocBusy(true); setError('')
+    try {
+      const impact = await invoke<FileImpact>('edit_file_impact', {
+        editDir: workspace.editDir, opfPath: workspace.opfPath, relPath: currentFile.relPath,
+      })
+      setFileOp(null)
+      setPendingFileOp({ kind: 'delete', from: currentFile.relPath, impact })
+    } catch (err) {
+      setError(`读取影响面失败：${String(err)}`)
+    } finally {
+      setTocBusy(false)
+    }
+  }, [workspace, currentFile, dirty, blockDirty, onNotify])
+
+  const confirmFileOp = useCallback(async () => {
+    if (!workspace || !pendingFileOp) return
+    setTocBusy(true); setError('')
+    try {
+      if (pendingFileOp.kind === 'delete') {
+        const r = await invoke<FileOpResult>('edit_delete_file', {
+          editDir: workspace.editDir, opfPath: workspace.opfPath, relPath: pendingFileOp.from,
+        })
+        setPendingFileOp(null)
+        await refreshFiles()
+        onNotify(`已删除 ${r.relPath}，同步 ${r.changedFiles.length} 个文件`)
+      } else {
+        const changed = await invoke<string[]>('edit_rename_file', {
+          editDir: workspace.editDir, opfPath: workspace.opfPath,
+          fromPath: pendingFileOp.from, toPath: pendingFileOp.to,
+        })
+        const to = pendingFileOp.to as string
+        setPendingFileOp(null)
+        await refreshFiles(to)
+        onNotify(`已${pendingFileOp.kind === 'move' ? '移动' : '重命名'}为 ${to}，同步 ${changed.length} 个引用文件`)
+      }
+    } catch (err) {
+      setError(`文件操作失败：${String(err)}`)
+    } finally {
+      setTocBusy(false)
+    }
+  }, [workspace, pendingFileOp, refreshFiles, onNotify])
+
   // ─── 多选 / 批量操作 ───
 
   const toggleSelect = (key: string, shift: boolean) => {
@@ -1271,6 +2245,18 @@ export default function EpubEditPanel({
 
   const selPaths = () => rows.filter(r => selected.has(r.key)).map(r => r.path)
   const firstSel = (): Row | null => rows.find(r => selected.has(r.key)) ?? null
+
+  /** 目录结构 → 打开选中项指向的正文文件，并切到段落视图继续编辑 */
+  const openSelectedTarget = () => {
+    const one = firstSel()
+    if (!one || selected.size !== 1) return
+    const target = findEntryByHref(entries, one.node.href)
+    if (!target) {
+      onNotify('这一项目录没有可打开的正文文件')
+      return
+    }
+    void handleSelect(target).then(() => setTab('blocks'))
+  }
 
   const moveSelected = (delta: number) => {
     if (!selected.size) return
@@ -1432,56 +2418,134 @@ export default function EpubEditPanel({
   // 编辑对象类型随当前文件变化（EPUB / TXT / FB2 …），不写死
   const fileKind = (epubPath.split('.').pop() || 'epub').toUpperCase()
 
-  return (
-    <div className="edit-panel">
-      {/* 顶部工具栏 */}
-      <header className="edit-panel__head">
-        <button className="btn icon-only" title="回到阅读模式" onClick={handleClose}>
-          <Icon name="arrow_back" />
-        </button>
-        <span className="edit-panel__title">
-          编辑 {fileKind} {(dirty || metaDirty || blockDirty) && <span className="edit-dirty">●</span>}
-        </span>
-        <span className="edit-panel__sub">{workspace ? baseName(workspace.originPath) : ''}</span>
-        <div className="edit-panel__actions">
-          <button className="btn icon-only" title="历史版本（保存时的 EPUB 快照）" onClick={() => void openRevisions()} disabled={!workspace}>
-            <Icon name="history" />
-          </button>
-          <button className="btn icon-only" title="写回当前文件 (Ctrl+S)" onClick={() => void handleWrite()} disabled={!(dirty || blockDirty)}>
-            <Icon name="save" />
-          </button>
-          <button className="btn icon-only" title="保存并重打包（覆盖原文件）" onClick={() => void handleSave()} disabled={saving}>
-            <Icon name="archive" />
-          </button>
-          <button className="btn icon-only" title="另存为（默认到最终成品文件夹）" onClick={() => void handleSaveAs()} disabled={saving}>
-            <Icon name="save_as" />
-          </button>
-          <button className="btn icon-only" title="epubcheck 检查" onClick={() => void handleCheck()} disabled={checking}>
-            <Icon name="fact_check" />
-          </button>
-          <button className="btn icon-only" title="关闭编辑，回到阅读" onClick={handleClose}>
-            <Icon name="close" />
-          </button>
-        </div>
-      </header>
+  // 能分块才允许富文本 / 分屏；非正文文件（css / opf / ncx）强制源码模式
+  const blockable = Boolean(blocks && blocks.length)
+  const view: BlockView = blockable ? blockView : 'source'
+  const sourceText = view === 'split' && mirrorText !== null ? mirrorText : (currentFile?.text ?? '')
+  const sourceFontSize = blockable ? blockFont : srcFont
 
-      {/* 面板内标签页 */}
-      <div className="edit-panel__tabs">
-        <button className={`edit-tab ${tab === 'blocks' ? 'on' : ''}`} onClick={() => setTab('blocks')}>
-          <Icon name="article" size={15} /> 段落
+  // 阅读标注只读渲染：富文本 / 分屏的富文本侧画高亮，源码视图不画
+  useEffect(() => {
+    if (view === 'source') {
+      clearChapterMarks()
+      return
+    }
+    const canvas = blockCanvasRef.current
+    if (!canvas || !currentFile) {
+      clearChapterMarks()
+      return
+    }
+    const relPath = currentFile.relPath
+    const raf = requestAnimationFrame(() => {
+      applyChapterMarks(collectChapterMarks(canvas, annotations, relPath))
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [view, blocks, annotations, currentFile?.relPath])
+
+  // 关闭编辑器时清掉全局高亮注册表，避免带到阅读页
+  useEffect(() => () => clearChapterMarks(), [])
+
+  // 嵌入阅读器时把工具栏状态交出去：顶栏渲染唯一的按钮行
+  useEffect(() => {
+    if (!onToolbar) return
+    onToolbar({
+      tab,
+      setTab,
+      dirty: dirty || metaDirty || blockDirty,
+      saving,
+      checking,
+      hasWorkspace: Boolean(workspace),
+      treeOpen,
+      toggleTree: () => setTreeOpen((value) => !value),
+      actions: {
+        history: () => void openRevisions(),
+        write: () => void handleWrite(),
+        save: () => void handleSave(),
+        saveAs: () => void handleSaveAs(),
+        check: () => void handleCheck(),
+      },
+    })
+  })
+  useEffect(() => {
+    return () => onToolbar?.(null)
+  }, [onToolbar])
+
+  const tabButtons = (
+    <>
+      <button className={`edit-tab ${tab === 'blocks' ? 'on' : ''}`} onClick={() => setTab('blocks')}>
+        <Icon name="article" size={15} /> 段落
+      </button>
+      <button className={`edit-tab ${tab === 'meta' ? 'on' : ''}`} onClick={() => setTab('meta')}>
+        <Icon name="sell" size={15} /> 元数据
+      </button>
+      <button
+        className={`edit-tab ${tab === 'toc' ? 'on' : ''}`}
+        data-tip="目录结构：编辑 nav.xhtml / toc.ncx 与 spine 顺序"
+        onClick={() => setTab('toc')}
+      >
+        <Icon name="account_tree" size={15} /> 目录结构
+      </button>
+    </>
+  )
+
+  const actionButtons = (
+    <>
+      <button className="btn icon-only" title="历史版本（保存时的 EPUB 快照）" onClick={() => void openRevisions()} disabled={!workspace}>
+        <Icon name="history" />
+      </button>
+      <button className="btn icon-only" title="写回当前文件 (Ctrl+S)" onClick={() => void handleWrite()} disabled={!(dirty || blockDirty)}>
+        <Icon name="save" />
+      </button>
+      <button className="btn icon-only" title="保存并重打包（覆盖原文件）" onClick={() => void handleSave()} disabled={saving}>
+        <Icon name="archive" />
+      </button>
+      <button className="btn icon-only" title="另存为（默认到最终成品文件夹）" onClick={() => void handleSaveAs()} disabled={saving}>
+        <Icon name="save_as" />
+      </button>
+      <button className="btn icon-only" title="epubcheck 检查" onClick={() => void handleCheck()} disabled={checking}>
+        <Icon name="fact_check" />
+      </button>
+      {!embedded && (
+        <button className="btn icon-only" title="关闭编辑，回到阅读" onClick={handleClose}>
+          <Icon name="close" />
         </button>
-        <button className={`edit-tab ${tab === 'source' ? 'on' : ''}`} onClick={() => setTab('source')}>
-          <Icon name="code" size={15} /> 源码
-        </button>
-        <button className={`edit-tab ${tab === 'meta' ? 'on' : ''}`} onClick={() => setTab('meta')}>
-          <Icon name="sell" size={15} /> 元数据
-        </button>
-        <button className={`edit-tab ${tab === 'toc' ? 'on' : ''}`} onClick={() => setTab('toc')}>
-          <Icon name="account_tree" size={15} /> 目录
-        </button>
-        <span className="grow" />
-        <span className="edit-panel__hintbar">Ctrl+滚轮可缩放编辑区字号</span>
-      </div>
+      )}
+    </>
+  )
+
+  return (
+    <div
+      className="edit-panel"
+      onKeyDown={event => {
+        if (tab !== 'blocks') return
+        // 源码框里让浏览器走原生撤销，不要被段落级撤销栈接管
+        if ((event.target as HTMLElement | null)?.tagName === 'TEXTAREA') return
+        if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'z') return
+        event.preventDefault()
+        event.stopPropagation()
+        if (event.shiftKey) redoBlocks()
+        else undoBlocks()
+      }}
+    >
+      {/* 嵌入模式不再自带头部：标签、文件树开关与操作按钮全部交给阅读器顶栏一行 */}
+      {!embedded && (
+        <>
+          <header className="edit-panel__head">
+            <button className="btn icon-only" title="回到阅读模式" onClick={handleClose}>
+              <Icon name="arrow_back" />
+            </button>
+            <span className="edit-panel__title">
+              编辑 {fileKind} {(dirty || metaDirty || blockDirty) && <span className="edit-dirty">●</span>}
+            </span>
+            <span className="edit-panel__sub">{workspace ? baseName(workspace.originPath) : ''}</span>
+            <div className="edit-panel__actions">{actionButtons}</div>
+          </header>
+
+          <div className="edit-panel__tabs">
+            {tabButtons}
+          </div>
+        </>
+      )}
 
       {loading && <div className="edit-panel__loading">正在解包…</div>}
       {error && <div className="edit-panel__error">{error}</div>}
@@ -1593,6 +2657,9 @@ export default function EpubEditPanel({
             </button>
             <button className="toc-tool" data-tip="重命名目标文件（同步 OPF/nav/ncx/书内链接）" aria-label="重命名文件" disabled={selected.size !== 1 || !firstSel()?.node.href} onClick={renameSelected}>
               <Icon name="drive_file_rename_outline" size={15} />
+            </button>
+            <button className="toc-tool" data-tip="打开选中项对应的正文文件（切到段落视图）" aria-label="打开对应文件" disabled={selected.size !== 1 || !firstSel()?.node.href} onClick={openSelectedTarget}>
+              <Icon name="open_in_new" size={15} />
             </button>
             <button className="toc-tool danger" data-tip="删除选中条目" aria-label="删除" disabled={!selected.size} onClick={deleteSelected}>
               <Icon name="delete" size={15} />
@@ -1735,26 +2802,122 @@ export default function EpubEditPanel({
         </div>
       )}
 
-      {!loading && workspace && (tab === 'blocks' || tab === 'source') && (
+      {!loading && workspace && tab === 'blocks' && (
         <div className="edit-panel__body">
-          {/* 文件树：段落视图只列正文与目录，样式 / 清单只在源码视图出现 */}
-          <aside className="edit-panel__tree" ref={treeRef}>
-            {Object.entries(visibleGroups).map(([role, list]) => (
-              <details key={role} open>
-                <summary>{role}（{list.length}）</summary>
-                <ul>
-                  {list.map(e => (
-                    <li key={e.path}
-                      className={currentFile?.relPath === e.path ? 'active' : ''}
-                      onClick={() => void handleSelect(e)}>
-                      <span className="en">{baseName(e.path)}</span>
-                      <span className="es">{formatBytes(e.size)}</span>
-                    </li>
-                  ))}
-                </ul>
-              </details>
-            ))}
-          </aside>
+          {/* 文件树是覆盖式抽屉：不挤占编辑区宽度，点遮罩 / Esc 收起 */}
+          {treeOpen && (
+            <>
+              <button className="edit-panel__veil" aria-label="收起文件树" onClick={() => setTreeOpen(false)} />
+              <aside className="edit-panel__tree" ref={treeRef}>
+                <div className="edit-panel__tree-head">
+                  <span>文件</span>
+                  <div className="edit-panel__tree-tools">
+                    <button className="toc-tool" data-tip="新建章节（同步 manifest / spine / 目录）" aria-label="新建章节" onClick={() => startFileOp('create')}>
+                      <Icon name="note_add" size={15} />
+                    </button>
+                    <button className="toc-tool" data-tip="重命名当前文件（同步书内链接）" aria-label="重命名文件" disabled={!currentFile} onClick={() => startFileOp('rename')}>
+                      <Icon name="drive_file_rename_outline" size={15} />
+                    </button>
+                    <button className="toc-tool" data-tip="移动当前文件（可改子目录）" aria-label="移动文件" disabled={!currentFile} onClick={() => startFileOp('move')}>
+                      <Icon name="drive_file_move" size={15} />
+                    </button>
+                    <button className="toc-tool danger" data-tip="删除当前文件（同步 manifest / spine / 目录）" aria-label="删除文件" disabled={!currentFile} onClick={() => void askDeleteFile()}>
+                      <Icon name="delete" size={15} />
+                    </button>
+                  </div>
+                  <button
+                    className="toc-tool"
+                    data-tip="收起（Esc）"
+                    aria-label="收起文件树"
+                    onClick={() => setTreeOpen(false)}
+                  >
+                    <Icon name="close" size={15} />
+                  </button>
+                </div>
+
+                {fileOp && (
+                  <div className="file-op-form">
+                    <span>{fileOp.kind === 'create' ? '新建章节' : fileOp.kind === 'rename' ? '重命名' : '移动到'}</span>
+                    {fileOp.kind !== 'create' && <span className="file-op-form__from">{currentFile?.relPath}</span>}
+                    <input
+                      value={fileOp.value}
+                      onChange={e => setFileOp({ ...fileOp, value: e.target.value })}
+                      placeholder={fileOp.kind === 'create' ? '文件名，如 chapter-21.xhtml' : fileOp.kind === 'rename' ? '同目录新文件名' : '目标路径，如 Text/ch-21.xhtml'}
+                      onKeyDown={e => { if (e.key === 'Enter') void submitFileOp() }}
+                    />
+                    {fileOp.kind === 'create' && (
+                      <input
+                        value={fileOp.title ?? ''}
+                        onChange={e => setFileOp({ ...fileOp, title: e.target.value })}
+                        placeholder="章节标题"
+                      />
+                    )}
+                    <button className="btn small primary" onClick={() => void submitFileOp()} disabled={tocBusy}>确定</button>
+                    <button className="btn small" onClick={() => setFileOp(null)}>取消</button>
+                  </div>
+                )}
+
+                {pendingFileOp && (
+                  <div className="file-op-impact">
+                    <div className="file-op-impact__head">
+                      {pendingFileOp.kind === 'delete' ? '删除前确认' : pendingFileOp.kind === 'move' ? '移动前确认' : '重命名前确认'}
+                      <button className="btn small icon-only" aria-label="取消" onClick={() => setPendingFileOp(null)}>
+                        <Icon name="close" size={13} />
+                      </button>
+                    </div>
+                    <div className="file-op-impact__file">
+                      {pendingFileOp.from}{pendingFileOp.to ? ` → ${pendingFileOp.to}` : ''}
+                    </div>
+                    <ul>
+                      <li>manifest：{pendingFileOp.impact.inManifest ? '会被移除/更新' : '未登记'}</li>
+                      <li>spine：{pendingFileOp.impact.inSpine ? '会被移除/更新' : '未在 spine'}</li>
+                      <li>目录：{pendingFileOp.impact.inToc ? '会被移除/更新' : '未在目录'}</li>
+                      <li>
+                        书内链接：{pendingFileOp.impact.refCount} 处
+                        {pendingFileOp.impact.refFiles.length > 0 && `（${pendingFileOp.impact.refFiles.slice(0, 4).join('、')}${pendingFileOp.impact.refFiles.length > 4 ? ' 等' : ''}）`}
+                      </li>
+                    </ul>
+                    <div className="file-op-impact__actions">
+                      <button className="btn small danger-solid" onClick={() => void confirmFileOp()} disabled={tocBusy}>确认执行</button>
+                      <button className="btn small" onClick={() => setPendingFileOp(null)}>取消</button>
+                    </div>
+                  </div>
+                )}
+
+                <details open>
+                  <summary>正文文件（{chapterList.length}）</summary>
+                  <ul>
+                    {chapterList.map(({ entry, label }) => (
+                      <li key={entry.path}
+                        className={`${currentFile?.relPath === entry.path ? 'active' : ''} is-chapter`}
+                        title={entry.path}
+                        onClick={() => void handleSelect(entry)}>
+                        <span className="en">{label || baseName(entry.path)}</span>
+                        <span className="ef">{baseName(entry.path)} · {formatBytes(entry.size)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+
+                {Object.entries(structuralGroups).map(([role, list]) => (
+                  <details key={role} open={role !== '图片'}>
+                    <summary>{role}（{list.length}）</summary>
+                    <ul>
+                      {list.map(e => (
+                        <li key={e.path}
+                          className={currentFile?.relPath === e.path ? 'active' : ''}
+                          title={e.path}
+                          onClick={() => void handleSelect(e)}>
+                          <span className="en">{baseName(e.path)}</span>
+                          <span className="es">{formatBytes(e.size)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                ))}
+              </aside>
+            </>
+          )}
 
           {/* 编辑区 */}
           <main className="edit-panel__content">
@@ -1768,8 +2931,8 @@ export default function EpubEditPanel({
                   <pre>二进制 · {currentFile.mime} · {formatBytes(currentFile.size)}</pre>
                 )}
               </div>
-            ) : tab === 'blocks' ? (
-              <div className={`block-view${splitOpen ? ' is-split' : ''}`}>
+            ) : (
+              <div className={`block-view view-${view}${view === 'split' ? ' is-split' : ''}`}>
                 <div className="block-bar">
                   <span className="block-bar__path">{currentFile.relPath}</span>
                   {blockDirty && <span className="edit-dirty">●</span>}
@@ -1794,12 +2957,30 @@ export default function EpubEditPanel({
                     </button>
                     <button
                       className="toc-tool"
+                      data-tip="下划线（Ctrl+U）"
+                      aria-label="下划线"
+                      onMouseDown={e => e.preventDefault()}
+                      onClick={handleUnderline}
+                    >
+                      <Icon name="format_underlined" size={15} />
+                    </button>
+                    <button
+                      className="toc-tool"
                       data-tip="链接（可填相对路径）"
                       aria-label="链接"
                       onMouseDown={e => e.preventDefault()}
                       onClick={handleLink}
                     >
                       <Icon name="link" size={15} />
+                    </button>
+                    <button
+                      className="toc-tool"
+                      data-tip="插入 EPUB 内已有图片"
+                      aria-label="插入图片"
+                      onMouseDown={e => e.preventDefault()}
+                      onClick={() => setImagePicker(true)}
+                    >
+                      <Icon name="image" size={15} />
                     </button>
                     <select
                       className="inline-tag"
@@ -1809,6 +2990,7 @@ export default function EpubEditPanel({
                       onChange={e => {
                         const i = activeBlockRef.current
                         if (i == null) { onNotify('先点一下要改级别的段落'); return }
+                        pushHistory()
                         changeBlockTag(i, e.target.value)
                       }}
                     >
@@ -1817,21 +2999,115 @@ export default function EpubEditPanel({
                       ))}
                     </select>
                   </div>
+                  <div className="inline-bar" role="group" aria-label="块操作">
+                    <select
+                      className="inline-tag"
+                      data-tip="新建块类型"
+                      aria-label="新建块类型"
+                      value={newBlockTag}
+                      onChange={e => setNewBlockTag(e.target.value)}
+                    >
+                      <option value="p">新段落</option>
+                      <option value="h1">新标题 1</option>
+                      <option value="h2">新标题 2</option>
+                      <option value="h3">新标题 3</option>
+                      <option value="blank">空行</option>
+                    </select>
+                    <button
+                      className="toc-tool"
+                      data-tip="在聚焦段之后新建块"
+                      aria-label="新建块"
+                      onMouseDown={e => e.preventDefault()}
+                      onClick={() => addBlock(
+                        newBlockTag === 'blank' ? 'p' : newBlockTag,
+                        newBlockTag === 'blank' ? '<br/>' : '',
+                      )}
+                    >
+                      <Icon name="add" size={15} />
+                    </button>
+                    <button
+                      className="toc-tool"
+                      data-tip="当前段上移"
+                      aria-label="上移"
+                      onMouseDown={e => e.preventDefault()}
+                      disabled={activeBlock == null}
+                      onClick={() => { const i = activeBlockRef.current; if (i != null) moveBlock(i, -1) }}
+                    >
+                      <Icon name="arrow_upward" size={15} />
+                    </button>
+                    <button
+                      className="toc-tool"
+                      data-tip="当前段下移"
+                      aria-label="下移"
+                      onMouseDown={e => e.preventDefault()}
+                      disabled={activeBlock == null}
+                      onClick={() => { const i = activeBlockRef.current; if (i != null) moveBlock(i, 1) }}
+                    >
+                      <Icon name="arrow_downward" size={15} />
+                    </button>
+                    <span className="toc-sep" />
+                    <button
+                      className="toc-tool"
+                      data-tip="撤销（Ctrl+Z）"
+                      aria-label="撤销"
+                      onMouseDown={e => e.preventDefault()}
+                      disabled={historyRef.current.undo.length === 0}
+                      onClick={undoBlocks}
+                    >
+                      <Icon name="undo" size={15} />
+                    </button>
+                    <button
+                      className="toc-tool"
+                      data-tip="重做（Ctrl+Shift+Z）"
+                      aria-label="重做"
+                      onMouseDown={e => e.preventDefault()}
+                      disabled={historyRef.current.redo.length === 0}
+                      onClick={redoBlocks}
+                    >
+                      <Icon name="redo" size={15} />
+                    </button>
+                  </div>
                   <span className="grow" />
                   {blocksStale && <span className="block-bar__stale">源码已改动，先刷新预览</span>}
-                  <span className="block-bar__hint">只提交改动段，其余段逐字节保留</span>
-                  <span className="edit-font">字号 {blockFont}px（Ctrl+滚轮）</span>
-                  <button
-                    className={`btn small${splitOpen ? ' primary' : ''}`}
-                    onClick={() => setSplitOpen(v => !v)}
-                    title="段落预览与源码并排（E4）"
-                  >
-                    {splitOpen ? '收起源码' : '并排源码'}
-                  </button>
+                  {blockError && view !== 'source' && <span className="block-bar__stale">{blockError}</span>}
+                  <span className="block-bar__hint">只提交改动段</span>
+                  <span className="edit-font">字号 {sourceFontSize}px</span>
+                  <div className="block-viewsw" role="group" aria-label="视图切换">
+                    <button
+                      className={`block-viewsw__btn${view === 'rich' ? ' on' : ''}`}
+                      data-tip="富文本模式：所见即所得，段落可直接编辑"
+                      aria-label="富文本模式"
+                      disabled={!blockable}
+                      onClick={() => setBlockView('rich')}
+                    >
+                      <Icon name="format_align_left" size={14} />
+                      <span>富文本</span>
+                    </button>
+                    <button
+                      className={`block-viewsw__btn${view === 'source' ? ' on' : ''}`}
+                      data-tip="源码模式：直接编辑章节 XHTML"
+                      aria-label="源码模式"
+                      onClick={() => setBlockView('source')}
+                    >
+                      <Icon name="code" size={14} />
+                      <span>源码</span>
+                    </button>
+                    <button
+                      className={`block-viewsw__btn${view === 'split' ? ' on' : ''}`}
+                      data-tip="分屏对照：左富文本右源码，滚动、光标、改动同步"
+                      aria-label="分屏对照"
+                      disabled={!blockable}
+                      onClick={() => setBlockView('split')}
+                    >
+                      <Icon name="vertical_split" size={14} />
+                      <span>分屏</span>
+                    </button>
+                  </div>
                   <button
                     className="btn small"
                     onClick={rebuildPreview}
                     title="按当前源码重新生成段落预览"
+                    disabled={!blockable}
                   >
                     刷新预览
                   </button>
@@ -1845,11 +3121,12 @@ export default function EpubEditPanel({
                   </button>
                 </div>
                 <div className="block-main">
+                  {view !== 'source' && (
                   <div className="block-canvas" ref={blockCanvasRef}>
                     {blockError ? (
                       <div className="block-empty">
                         <p>{blockError}</p>
-                        <button className="btn small" onClick={() => setTab('source')}>切到源码视图</button>
+                        <button className="btn small" onClick={() => setBlockView('source')}>切到源码模式</button>
                       </div>
                     ) : !blocks || blocks.length === 0 ? (
                       <div className="block-empty">这个文件没有可分块的正文</div>
@@ -1862,9 +3139,9 @@ export default function EpubEditPanel({
                         {blocks.map((b, i) => {
                           const isDeleted = deletedIdx.has(i)
                           return (
+                            <Fragment key={`${currentFile.relPath}-${i}`}>
                             <div
-                              className={`blk${isDeleted ? ' is-deleted' : ''}`}
-                              key={`${currentFile.relPath}-${i}`}
+                              className={`blk${isDeleted ? ' is-deleted' : ''}${srcActiveBlock === i && view === 'split' ? ' is-src-active' : ''}`}
                               data-blk-index={i}
                             >
                               <span className="blk-tag" title={`源码标签 ${b.origTag}`}>
@@ -1884,6 +3161,7 @@ export default function EpubEditPanel({
                                   dangerouslySetInnerHTML={{ __html: b.html }}
                                   onFocus={() => setActiveBlock(i)}
                                   onInput={e => {
+                                    if (Date.now() - lastHistoryAtRef.current > 1200) pushHistory()
                                     blockEdits.current[i] = (e.currentTarget as HTMLElement).innerHTML
                                     if (!blockDirty) setBlockDirty(true)
                                   }}
@@ -1892,6 +3170,29 @@ export default function EpubEditPanel({
                               )}
                               {!isDeleted && (
                                 <>
+                                  {translatedOrigin[i] !== undefined && (
+                                    <button
+                                      className="blk-restore"
+                                      data-tip="恢复这段翻译前的原文"
+                                      aria-label="恢复原文"
+                                      onClick={() => {
+                                        const original = translatedOrigin[i]
+                                        blockEdits.current[i] = original
+                                        setBlocks(prev =>
+                                          prev ? prev.map((r, j) => (j === i ? { ...r, html: original } : r)) : prev,
+                                        )
+                                        if (!blockDirty) setBlockDirty(true)
+                                        setTranslatedOrigin(prev => {
+                                          const next = { ...prev }
+                                          delete next[i]
+                                          return next
+                                        })
+                                        onNotify('已恢复原文')
+                                      }}
+                                    >
+                                      <Icon name="undo" size={13} />
+                                    </button>
+                                  )}
                                   <button
                                     className="blk-translate"
                                     data-tip="翻译这段（会替换块内正文；可在段落预览里继续改）"
@@ -1900,6 +3201,7 @@ export default function EpubEditPanel({
                                     onClick={async () => {
                                       if (translatingBlock === i) return
                                       setTranslatingBlock(i)
+                                      setTranslateError(null)
                                       const sourceText = (b.html.replace(/<[^>]+>/g, ' ') || '')
                                         .replace(/\s+/g, ' ')
                                         .trim()
@@ -1912,19 +3214,37 @@ export default function EpubEditPanel({
                                         const outcome = await translateOne({
                                           config: translateConfigFromPrefs(prefs),
                                           source: sourceText,
-                                          glossary: [],
+                                          glossary: glossaryRef.current,
+                                          memory: memoryRef.current,
                                         })
                                         // sanitizeInline：白名单 + XML 校验，保证塞回 blockEdits 合法
                                         const sanitized = sanitizeInline(outcome.text)
+                                        // 记下翻译前的正文（只在首次翻译时记，避免覆盖真正的原文）
+                                        const beforeHtml = blockEdits.current[i] ?? b.html
+                                        setTranslatedOrigin(prev => (prev[i] ? prev : { ...prev, [i]: beforeHtml }))
                                         blockEdits.current[i] = sanitized.xml
                                         setBlocks(prev =>
                                           prev ? prev.map((r, j) => (j === i ? { ...r, html: sanitized.xml } : r)) : prev,
                                         )
                                         if (!blockDirty) setBlockDirty(true)
-                                        const engineName = outcome.engine === 'online' ? '在线' : outcome.engine === 'local' ? '本地' : '记忆命中'
+                                        // P3：翻译只是草稿；等「应用改动 / 保存」人工确认后才写进翻译记忆
+                                        const engineName =
+                                          outcome.engine === 'online'
+                                            ? '在线'
+                                            : outcome.engine === 'baidu'
+                                              ? '百度'
+                                              : outcome.engine === 'baiduLlm'
+                                                ? '百度大模型'
+                                                : outcome.engine === 'local'
+                                                ? '本地'
+                                                : outcome.engine === 'builtin'
+                                                  ? '内置'
+                                                  : '记忆命中'
                                         onNotify(`已翻译（${engineName} · ${outcome.elapsedMs.toFixed(0)}ms），可继续在段落里改`)
                                       } catch (err) {
-                                        onNotify(`翻译失败：${String(err)}`)
+                                        const message = `翻译失败：${String(err)}`
+                                        setTranslateError({ index: i, message })
+                                        onNotify(message)
                                       } finally {
                                         setTranslatingBlock(null)
                                       }
@@ -1942,45 +3262,102 @@ export default function EpubEditPanel({
                                   </button>
                                 </>
                               )}
+                              {translateError?.index === i && (
+                                <div className="blk-error" role="alert">{translateError.message}</div>
+                              )}
                             </div>
+                            {(inserts[i] ?? []).map(row => (
+                              <div
+                                className={`blk is-new${activeInsert?.id === row.id ? ' on' : ''}`}
+                                key={`new-${row.id}`}
+                                data-new-id={row.id}
+                              >
+                                <span className="blk-tag">{row.tag}</span>
+                                <div
+                                  className={`blk-body blk-${row.tag}`}
+                                  contentEditable
+                                  suppressContentEditableWarning
+                                  spellCheck={false}
+                                  data-placeholder="新建块：在这里输入内容"
+                                  dangerouslySetInnerHTML={{ __html: row.html }}
+                                  onFocus={() => setActiveInsert({ anchor: i, id: row.id })}
+                                  onInput={e => {
+                                    if (Date.now() - lastHistoryAtRef.current > 1200) pushHistory()
+                                    updateInsert(row.id, (e.currentTarget as HTMLElement).innerHTML)
+                                  }}
+                                />
+                                <button
+                                  className="blk-del"
+                                  data-tip="丢弃这个新建块"
+                                  aria-label="丢弃新建块"
+                                  onClick={() => removeInsert(i, row.id)}
+                                >
+                                  <Icon name="delete" size={13} />
+                                </button>
+                              </div>
+                            ))}
+                            </Fragment>
                           )
                         })}
                       </div>
                     )}
                   </div>
-                  {splitOpen && (
+                  )}
+                  {view !== 'rich' && (
                     <div className="block-source">
                       <textarea
                         ref={splitSrcRef}
-                        value={currentFile.text ?? ''}
+                        value={sourceText}
                         onChange={e => handleSplitSourceChange(e.target.value)}
+                        onSelect={handleSourceCaret}
+                        onClick={handleSourceCaret}
+                        onKeyUp={handleSourceCaret}
                         spellCheck={false}
                         wrap="off"
-                        style={{ fontSize: `${srcFont}px`, lineHeight: 1.6 }}
+                        style={{ fontSize: `${sourceFontSize}px`, lineHeight: view === 'split' ? 1.9 : 1.65 }}
                       />
                     </div>
                   )}
                 </div>
               </div>
-            ) : (
-              <>
-                <div className="edit-panel__fileinfo">
-                  {currentFile.relPath} · {currentFile.mime} · {formatBytes(currentFile.size)}
-                  {dirty && <span className="edit-dirty">● 已修改</span>}
-                  <span className="edit-font">字号 {srcFont}px（Ctrl+滚轮）</span>
-                </div>
-                <textarea
-                  className="edit-panel__textarea"
-                  ref={srcRef}
-                  value={currentFile.text ?? ''}
-                  onChange={e => handleTextChange(e.target.value)}
-                  spellCheck={false}
-                  wrap="off"
-                  style={{ fontSize: `${srcFont}px`, lineHeight: 1.65 }}
-                />
-              </>
             )}
           </main>
+
+          {/* D：插入图片——从 EPUB 现有图片资源里挑一张 */}
+          {imagePicker && (
+            <div className="img-picker" role="dialog" aria-label="插入图片">
+              <div className="img-picker__head">
+                <span>插入 EPUB 内图片（{imageEntries.length}）</span>
+                <span className="grow" />
+                <button
+                  className="btn small icon-only"
+                  data-tip="关闭"
+                  aria-label="关闭"
+                  onClick={() => setImagePicker(false)}
+                >
+                  <Icon name="close" size={13} />
+                </button>
+              </div>
+              {imageEntries.length === 0 ? (
+                <div className="img-picker__empty">这本 EPUB 里没有图片资源</div>
+              ) : (
+                <div className="img-picker__list">
+                  {imageEntries.map(entry => (
+                    <button
+                      key={entry.path}
+                      className="img-picker__item"
+                      data-tip={entry.path}
+                      onClick={() => insertImage(entry)}
+                    >
+                      <Icon name="image" size={14} />
+                      <span className="img-picker__name">{baseName(entry.path)}</span>
+                      <span className="img-picker__meta">{formatBytes(entry.size)}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* 检查结果 */}
           {checkResults && (

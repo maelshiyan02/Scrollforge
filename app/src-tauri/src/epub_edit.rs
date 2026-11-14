@@ -1516,6 +1516,53 @@ fn rewrite_tag_hrefs(raw: &str, from: &str, to: &str, dir: &str) -> (String, boo
     (out, true)
 }
 
+/// 文件整体换目录后，把它自身的 href/src 重算为相对新目录（保持指向同一目标）
+fn rebase_links(raw: &str, old_dir: &str, new_dir: &str) -> String {
+    if old_dir == new_dir { return raw.to_string(); }
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    for (pat, q) in [("href=\"", '"'), ("href='", '\''), ("src=\"", '"'), ("src='", '\'')] {
+        let mut idx = 0usize;
+        while let Some(p) = raw[idx..].find(pat) {
+            let vs = idx + p + pat.len();
+            if let Some(rel) = raw[vs..].find(q) {
+                let ve = vs + rel;
+                let val = &raw[vs..ve];
+                let (path, frag) = split_frag(val);
+                let external = path.is_empty()
+                    || path.starts_with("http:")
+                    || path.starts_with("https:")
+                    || path.starts_with("mailto:")
+                    || path.starts_with("data:")
+                    || path.starts_with("tel:");
+                if !external {
+                    let resolved = if path.starts_with('/') {
+                        norm_join("", path.trim_start_matches('/'))
+                    } else {
+                        norm_join(old_dir, path)
+                    };
+                    let mut next = rel_from_dir(&resolved, new_dir);
+                    if !frag.is_empty() {
+                        next.push('#');
+                        next.push_str(&frag);
+                    }
+                    if next != val {
+                        replacements.push((vs, ve, next));
+                    }
+                }
+                idx = ve + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    replacements.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = raw.to_string();
+    for (s, e, v) in replacements {
+        out.replace_range(s..e, &v);
+    }
+    out
+}
+
 /// 重命名/移动工作副本内的文件，并同步 OPF/nav/ncx/书内相对链接
 pub fn rename_file(
     edit_dir: &Path,
@@ -1549,7 +1596,21 @@ pub fn rename_file(
         if !is_text { continue; }
         let path = edit_dir.join(&rel);
         let raw = match fs::read_to_string(&path) { Ok(v) => v, Err(_) => continue };
-        let (out, did) = rewrite_tag_hrefs(&raw, &from, &to, dir_of(&rel));
+        let mut out = raw.clone();
+        let mut did = false;
+
+        // 移动文件自身跨目录：相对链接（CSS/图片/锚点）要按新目录重算
+        if rel == to && dir_of(&from) != dir_of(&to) {
+            let rebased = rebase_links(&raw, dir_of(&from), dir_of(&to));
+            did = rebased != raw;
+            out = rebased;
+        }
+
+        let (rewritten, changed_refs) = rewrite_tag_hrefs(&out, &from, &to, dir_of(&rel));
+        if changed_refs {
+            out = rewritten;
+            did = true;
+        }
         if did {
             fs::write(&path, out).map_err(|e| format!("写 {} 失败: {}", rel, e))?;
             changed.push(rel);
@@ -1588,6 +1649,478 @@ fn walk_any_collect(base: &Path, dir: &Path, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+// ── 文件级操作：影响面 / 新建 / 删除 ──
+
+/// 文件级操作的影响面：会被 manifest / spine / 目录引用，以及书内其他文件的链接数量
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FileImpact {
+    pub exists: bool,
+    pub in_manifest: bool,
+    pub in_spine: bool,
+    pub in_toc: bool,
+    pub ref_files: Vec<String>,
+    pub ref_count: usize,
+}
+
+/// 文件级操作结果：新路径、被改写的文件、结构同步情况
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileOpResult {
+    pub rel_path: String,
+    pub changed_files: Vec<String>,
+    pub added_manifest: bool,
+    pub added_spine: bool,
+    pub added_toc: bool,
+}
+
+fn norm_rel_path(p: &str) -> String {
+    p.replace('\\', "/").trim_start_matches('/').to_string()
+}
+
+fn is_text_file(rel: &str) -> bool {
+    let lower = rel.to_lowercase();
+    [".xhtml", ".html", ".htm", ".opf", ".ncx", ".xml", ".css", ".smil"]
+        .iter()
+        .any(|e| lower.ends_with(e))
+}
+
+/// 统计一个文本文件里指向 target 的 href/src 出现次数
+fn count_link_refs(raw: &str, target: &str, dir: &str) -> usize {
+    let mut n = 0usize;
+    for (pat, q) in [("href=\"", '"'), ("href='", '\''), ("src=\"", '"'), ("src='", '\'')] {
+        let mut idx = 0usize;
+        while let Some(p) = raw[idx..].find(pat) {
+            let vs = idx + p + pat.len();
+            if let Some(rel) = raw[vs..].find(q) {
+                let ve = vs + rel;
+                let (path, _) = split_frag(&raw[vs..ve]);
+                if !path.is_empty()
+                    && !path.starts_with("http:")
+                    && !path.starts_with("https:")
+                    && !path.starts_with("mailto:")
+                    && !path.starts_with("data:")
+                    && !path.starts_with("tel:")
+                {
+                    let resolved = if path.starts_with('/') {
+                        norm_join("", path.trim_start_matches('/'))
+                    } else {
+                        norm_join(dir, path)
+                    };
+                    if resolved == target { n += 1; }
+                }
+                idx = ve + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    n
+}
+
+/// 查询某个文件被哪些结构位置和书内链接引用
+pub fn file_impact(edit_dir: &Path, opf_rel: &str, rel_path: &str) -> Result<FileImpact, String> {
+    let target = norm_rel_path(rel_path);
+    let mut impact = FileImpact::default();
+    impact.exists = edit_dir.join(&target).is_file();
+
+    let opf_raw = read_text(edit_dir, opf_rel)?;
+    let opf_dir = dir_of(opf_rel);
+    let items = opf_items(&opf_raw, opf_dir);
+    impact.in_manifest = items
+        .iter()
+        .any(|(_, href, _, _)| strip_frag_path(href) == target);
+
+    if let Some((ss, se)) = block_range(&opf_raw, "<spine", "</spine>") {
+        let mut i = ss;
+        while let Some((s, oe, _)) = find_start_tag(&opf_raw, "itemref", i, se) {
+            if let Some(idref) = attr_value(&opf_raw[s..=oe], "idref") {
+                if let Some((_, href, _, _)) = items.iter().find(|(id, _, _, _)| *id == idref) {
+                    if strip_frag_path(href) == target {
+                        impact.in_spine = true;
+                        break;
+                    }
+                }
+            }
+            i = oe + 1;
+        }
+    }
+
+    if let Ok(doc) = read_toc(edit_dir, opf_rel) {
+        let mut hrefs = Vec::new();
+        collect_hrefs(&doc.tree, &mut hrefs);
+        impact.in_toc = hrefs.iter().any(|h| strip_frag_path(h) == target);
+    }
+
+    let mut files = Vec::new();
+    walk_any_collect(edit_dir, edit_dir, &mut files);
+    for rel in files {
+        if rel == target || !is_text_file(&rel) { continue; }
+        if let Ok(raw) = fs::read_to_string(edit_dir.join(&rel)) {
+            let n = count_link_refs(&raw, &target, dir_of(&rel));
+            if n > 0 {
+                impact.ref_count += n;
+                impact.ref_files.push(rel);
+            }
+        }
+    }
+    Ok(impact)
+}
+
+/// 按磁盘现状重建 _index.json（文件树数据源）
+fn rebuild_index(edit_dir: &Path, opf_rel: &str) -> Result<(), String> {
+    let opf_raw = read_text(edit_dir, opf_rel).unwrap_or_default();
+    let opf_dir = dir_of(opf_rel);
+    let mut ids: HashMap<String, String> = HashMap::new();
+    for (id, href, _, _) in opf_items(&opf_raw, opf_dir) {
+        ids.insert(strip_frag_path(&href), id);
+    }
+
+    let mut files = Vec::new();
+    walk_any_collect(edit_dir, edit_dir, &mut files);
+    let mut list = Vec::new();
+    for rel in files {
+        let size = fs::metadata(edit_dir.join(&rel)).map(|m| m.len()).unwrap_or(0);
+        let mime = infer_mime_str(&rel);
+        list.push(EntryInfo {
+            role: infer_role_str(&rel, &mime),
+            path: rel.clone(),
+            media_type: mime,
+            id: ids.get(&rel).cloned(),
+            size,
+            crc: 0,
+            compressed: 0,
+            stored: false,
+        });
+    }
+    let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+    fs::write(edit_dir.join("_index.json"), json).map_err(|e| format!("写 _index.json 失败: {}", e))
+}
+
+fn id_from_path(rel: &str) -> String {
+    let stem = rel.rsplit('/').next().unwrap_or(rel);
+    let stem = stem.split('.').next().unwrap_or(stem);
+    let mut s = String::new();
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() {
+            s.push(ch.to_ascii_lowercase());
+        } else if !s.ends_with('_') {
+            s.push('_');
+        }
+    }
+    let s = s.trim_matches('_').to_string();
+    if s.is_empty() {
+        "chapter".into()
+    } else if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        format!("ch_{}", s)
+    } else {
+        s
+    }
+}
+
+fn unique_manifest_id(items: &[(String, String, String, Option<String>)], base: &str) -> String {
+    let used: HashSet<&str> = items.iter().map(|(id, _, _, _)| id.as_str()).collect();
+    let mut id = base.to_string();
+    let mut n = 2usize;
+    while used.contains(id.as_str()) {
+        id = format!("{}-{}", base, n);
+        n += 1;
+    }
+    id
+}
+
+/// 新建章节：写模板文件并注册到 manifest / spine / nav / ncx
+pub fn create_chapter(
+    edit_dir: &Path,
+    opf_rel: &str,
+    rel_path: &str,
+    title: &str,
+) -> Result<FileOpResult, String> {
+    let target = norm_rel_path(rel_path);
+    if target.is_empty() { return Err("文件名不能为空".into()); }
+    if target.contains("..") { return Err("路径不允许包含 ..".into()); }
+    let lower = target.to_lowercase();
+    if !(lower.ends_with(".xhtml") || lower.ends_with(".html") || lower.ends_with(".htm")) {
+        return Err("新建章节必须是 .xhtml / .html 文件".into());
+    }
+    let dst = edit_dir.join(&target);
+    if dst.exists() { return Err(format!("目标文件已存在: {}", target)); }
+
+    let file_stem = target.rsplit('/').next().unwrap_or(&target);
+    let file_stem = file_stem.split('.').next().unwrap_or(file_stem);
+    let title = if title.trim().is_empty() { file_stem.to_string() } else { title.trim().to_string() };
+
+    let opf_raw = read_text(edit_dir, opf_rel)?;
+    let opf_dir = dir_of(opf_rel);
+    let items = opf_items(&opf_raw, opf_dir);
+
+    let css = items
+        .iter()
+        .find(|(_, _, media, _)| media == "text/css")
+        .map(|(_, href, _, _)| href.clone());
+    let link = match css {
+        Some(css) => format!(
+            "\n  <link rel=\"stylesheet\" type=\"text/css\" href=\"{}\"/>",
+            escape_xml_attr(&rel_from_dir(&css, dir_of(&target)))
+        ),
+        None => String::new(),
+    };
+    let html = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+<!DOCTYPE html>\n\
+<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\" xml:lang=\"zh-CN\" lang=\"zh-CN\">\n\
+<head>\n\
+  <meta charset=\"utf-8\"/>\n\
+  <title>{title}</title>{link}\n\
+</head>\n\
+<body>\n\
+  <section epub:type=\"chapter\">\n\
+    <h1>{title}</h1>\n\
+    <p></p>\n\
+  </section>\n\
+</body>\n\
+</html>\n",
+        title = escape_xml_text(&title),
+        link = link
+    );
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+    }
+    fs::write(&dst, html).map_err(|e| format!("写新章节失败: {}", e))?;
+
+    let id = unique_manifest_id(&items, &id_from_path(&target));
+    let href = rel_from_dir(&target, opf_dir);
+    let item_line = format!(
+        "<item id=\"{}\" href=\"{}\" media-type=\"application/xhtml+xml\"/>",
+        escape_xml_attr(&id),
+        escape_xml_attr(&href)
+    );
+
+    let mut opf = opf_raw.clone();
+    let mut added_manifest = false;
+    if let Some((ms, _me)) = block_range(&opf, "<manifest", "</manifest>") {
+        if let Some(rel) = opf[ms..].find("</manifest>") {
+            opf = insert_before(&opf, ms + rel, &item_line);
+            added_manifest = true;
+        }
+    }
+
+    let mut added_spine = false;
+    if added_manifest {
+        if let Some((ss, _se)) = block_range(&opf, "<spine", "</spine>") {
+            if let Some(rel) = opf[ss..].find("</spine>") {
+                let ref_line = format!("<itemref idref=\"{}\"/>", escape_xml_attr(&id));
+                opf = insert_before(&opf, ss + rel, &ref_line);
+                added_spine = true;
+            }
+        }
+        fs::write(edit_dir.join(opf_rel), &opf).map_err(|e| format!("写 OPF 失败: {}", e))?;
+    }
+
+    let mut added_toc = false;
+    let mut changed = vec![target.clone()];
+    if added_manifest { changed.push(opf_rel.replace('\\', "/")); }
+    if let Ok(doc) = read_toc(edit_dir, opf_rel) {
+        let mut tree = doc.tree;
+        tree.push(TocNode { label: title.clone(), href: target.clone(), children: Vec::new() });
+        if write_toc(edit_dir, opf_rel, &tree, true).is_ok() {
+            added_toc = true;
+            if let Some(nav) = doc.nav_path { changed.push(nav); }
+            if let Some(ncx) = doc.ncx_path { changed.push(ncx); }
+        }
+    }
+    rebuild_index(edit_dir, opf_rel)?;
+
+    Ok(FileOpResult {
+        rel_path: target,
+        changed_files: changed,
+        added_manifest,
+        added_spine,
+        added_toc,
+    })
+}
+
+fn splice_out(raw: &str, ranges: &[(usize, usize)]) -> String {
+    let mut out = raw.to_string();
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by(|a, b| b.0.cmp(&a.0));
+    for (s, e) in sorted {
+        if s < e && e <= out.len() {
+            out.replace_range(s..e, "");
+        }
+    }
+    out
+}
+
+/// 从 manifest 删除 href 指向 target 的条目，返回新文本与被删条目的 id
+fn remove_manifest_items(raw: &str, opf_dir: &str, target: &str) -> (String, Vec<String>) {
+    let (ms, me) = match block_range(raw, "<manifest", "</manifest>") {
+        Some(v) => v,
+        None => return (raw.to_string(), Vec::new()),
+    };
+    let mut ranges = Vec::new();
+    let mut ids = Vec::new();
+    let mut i = ms;
+    while let Some((s, oe, _)) = find_start_tag(raw, "item", i, me) {
+        let tag = &raw[s..=oe];
+        let href = attr_value(tag, "href").unwrap_or_default();
+        if !href.is_empty() && strip_frag_path(&resolve_href(opf_dir, &href)) == target {
+            let mut start = s;
+            while start > ms && matches!(raw.as_bytes()[start - 1], b' ' | b'\t') {
+                start -= 1;
+            }
+            ranges.push((start, oe + 1));
+            if let Some(id) = attr_value(tag, "id") { ids.push(id); }
+        }
+        i = oe + 1;
+    }
+    (splice_out(raw, &ranges), ids)
+}
+
+/// 从 spine 删除 idref 命中 ids 的 itemref
+fn remove_spine_refs(raw: &str, ids: &HashSet<String>) -> String {
+    let (ss, se) = match block_range(raw, "<spine", "</spine>") {
+        Some(v) => v,
+        None => return raw.to_string(),
+    };
+    let mut ranges = Vec::new();
+    let mut i = ss;
+    while let Some((s, oe, _)) = find_start_tag(raw, "itemref", i, se) {
+        let idref = attr_value(&raw[s..=oe], "idref").unwrap_or_default();
+        if ids.contains(&idref) {
+            let mut start = s;
+            while start > ss
+                && matches!(raw.as_bytes()[start - 1], b' ' | b'\t' | b'\n' | b'\r')
+            {
+                start -= 1;
+            }
+            ranges.push((start, oe + 1));
+        }
+        i = oe + 1;
+    }
+    splice_out(raw, &ranges)
+}
+
+/// 删除文本里指向 target 的 href/src 属性（连同属性前的空白）
+fn strip_attr_refs(raw: &str, target: &str, dir: &str) -> (String, usize) {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (pat, q) in [("href=\"", '"'), ("href='", '\''), ("src=\"", '"'), ("src='", '\'')] {
+        let mut idx = 0usize;
+        while let Some(p) = raw[idx..].find(pat) {
+            let vs = idx + p + pat.len();
+            if let Some(rel) = raw[vs..].find(q) {
+                let ve = vs + rel;
+                let (path, _) = split_frag(&raw[vs..ve]);
+                let external = path.is_empty()
+                    || path.starts_with("http:")
+                    || path.starts_with("https:")
+                    || path.starts_with("mailto:")
+                    || path.starts_with("data:")
+                    || path.starts_with("tel:");
+                if !external {
+                    let resolved = if path.starts_with('/') {
+                        norm_join("", path.trim_start_matches('/'))
+                    } else {
+                        norm_join(dir, path)
+                    };
+                    if resolved == target {
+                        let mut start = idx + p;
+                        if start > 0
+                            && matches!(raw.as_bytes()[start - 1], b' ' | b'\t' | b'\n' | b'\r')
+                        {
+                            start -= 1;
+                        }
+                        ranges.push((start, ve + 1));
+                    }
+                }
+                idx = ve + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    let n = ranges.len();
+    (splice_out(raw, &ranges), n)
+}
+
+/// 删除文件：同步 manifest / spine / nav / ncx，并清掉书内指向它的链接
+pub fn delete_file(edit_dir: &Path, opf_rel: &str, rel_path: &str) -> Result<FileOpResult, String> {
+    let target = norm_rel_path(rel_path);
+    if target.is_empty() || target.contains("..") { return Err("路径不合法".into()); }
+    let src = edit_dir.join(&target);
+    if !src.is_file() { return Err(format!("文件不存在: {}", target)); }
+
+    let opf_raw = read_text(edit_dir, opf_rel)?;
+    let opf_dir = dir_of(opf_rel);
+    let (nav_path, ncx_path) = toc_paths(&opf_raw, opf_dir);
+    if target == "mimetype"
+        || target.starts_with("META-INF/")
+        || target == opf_rel.replace('\\', "/")
+        || nav_path.as_deref() == Some(target.as_str())
+        || ncx_path.as_deref() == Some(target.as_str())
+    {
+        return Err("这是 EPUB 必需文件，不能删除".into());
+    }
+
+    let mut changed = Vec::new();
+
+    // 1. 目录项先删：write_toc 期间 manifest 仍完整，nav/ncx 同步重建
+    if let Ok(doc) = read_toc(edit_dir, opf_rel) {
+        fn prune(nodes: Vec<TocNode>, target: &str, removed: &mut usize) -> Vec<TocNode> {
+            let mut out = Vec::new();
+            for n in nodes {
+                if !n.href.is_empty() && strip_frag_path(&n.href) == target {
+                    *removed += 1;
+                    continue;
+                }
+                let kids = prune(n.children, target, removed);
+                out.push(TocNode { label: n.label, href: n.href, children: kids });
+            }
+            out
+        }
+        let mut removed = 0usize;
+        let tree = prune(doc.tree, &target, &mut removed);
+        if removed > 0 && write_toc(edit_dir, opf_rel, &tree, false).is_ok() {
+            if let Some(nav) = doc.nav_path { changed.push(nav); }
+            if let Some(ncx) = doc.ncx_path { changed.push(ncx); }
+        }
+    }
+
+    // 2. manifest + spine
+    let opf_now = read_text(edit_dir, opf_rel)?;
+    let (opf_after, ids) = remove_manifest_items(&opf_now, opf_dir, &target);
+    let id_set: HashSet<String> = ids.into_iter().collect();
+    let opf_after = if id_set.is_empty() { opf_after } else { remove_spine_refs(&opf_after, &id_set) };
+    if opf_after != opf_now {
+        fs::write(edit_dir.join(opf_rel), &opf_after).map_err(|e| format!("写 OPF 失败: {}", e))?;
+        changed.push(opf_rel.replace('\\', "/"));
+    }
+
+    // 3. 删文件，并清掉其他文本里的链接
+    fs::remove_file(&src).map_err(|e| format!("删除失败: {}", e))?;
+    let mut files = Vec::new();
+    walk_any_collect(edit_dir, edit_dir, &mut files);
+    for rel in files {
+        if !is_text_file(&rel) { continue; }
+        let path = edit_dir.join(&rel);
+        let raw = match fs::read_to_string(&path) { Ok(v) => v, Err(_) => continue };
+        let (out, n) = strip_attr_refs(&raw, &target, dir_of(&rel));
+        if n > 0 {
+            fs::write(&path, out).map_err(|e| format!("写 {} 失败: {}", rel, e))?;
+            changed.push(rel);
+        }
+    }
+
+    rebuild_index(edit_dir, opf_rel)?;
+    Ok(FileOpResult {
+        rel_path: target,
+        changed_files: changed,
+        added_manifest: false,
+        added_spine: false,
+        added_toc: false,
+    })
 }
 
 // ── 全书扫描报告 ──
@@ -1813,11 +2346,22 @@ pub struct BlockEdit {
     pub delete: bool,
 }
 
+/// 新增块：在第 `index` 段之后插入一个新块（D 阶段：新建段落 / 标题 / 空行）。
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InsertEdit {
+    pub index: usize,
+    pub tag: String,
+    #[serde(default)]
+    pub inner: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockWriteResult {
     pub replaced: usize,
     pub deleted: usize,
+    pub inserted: usize,
     pub total: usize,
     pub bytes_before: usize,
     pub bytes_after: usize,
@@ -2028,18 +2572,47 @@ fn validate_xml(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 插入块用的行首缩进与换行风格：与所在行保持一致，避免写回后排版突变。
+fn line_indent(raw: &str, pos: usize) -> String {
+    let line_start = raw[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    raw[line_start..pos]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+
+fn newline_of(raw: &str) -> &'static str {
+    if raw.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
 /// 应用块改动（纯函数，便于单测）：从后往前拼接，未改动块逐字节保留。
+#[cfg(test)]
 pub fn apply_block_edits(raw: &str, edits: &[BlockEdit]) -> Result<(String, usize, usize), String> {
+    let (out, replaced, deleted, _inserted) = apply_block_edits_ex(raw, edits, &[])?;
+    Ok((out, replaced, deleted))
+}
+
+/// 与 `apply_block_edits` 相同，额外支持在指定块之后插入新块。
+pub fn apply_block_edits_ex(
+    raw: &str,
+    edits: &[BlockEdit],
+    inserts: &[InsertEdit],
+) -> Result<(String, usize, usize, usize), String> {
     let blocks = scan_blocks_raw(raw)?;
     let total = blocks.len();
-    if edits.is_empty() {
-        return Ok((raw.to_string(), 0, 0));
+    if edits.is_empty() && inserts.is_empty() {
+        return Ok((raw.to_string(), 0, 0, 0));
     }
 
     let mut seen = HashSet::new();
     let mut actions: Vec<(usize, usize, String)> = Vec::new();
     let mut replaced = 0usize;
     let mut deleted = 0usize;
+    let mut inserted = 0usize;
 
     for edit in edits {
         if !seen.insert(edit.index) {
@@ -2080,6 +2653,46 @@ pub fn apply_block_edits(raw: &str, edits: &[BlockEdit]) -> Result<(String, usiz
         replaced += 1;
     }
 
+    // 新增块：同一个锚点后的多次插入按请求顺序拼接，保证「连着新建几段」顺序正确
+    let mut insert_groups: Vec<(usize, String)> = Vec::new();
+    for ins in inserts {
+        let info = blocks
+            .get(ins.index)
+            .ok_or_else(|| format!("插入锚点 {} 不存在（共 {} 段）", ins.index + 1, total))?;
+        let tag = ins.tag.trim().to_lowercase();
+        if !BLOCK_TAGS.contains(&tag.as_str()) {
+            return Err(format!("不支持的新建块标签：{}", ins.tag));
+        }
+        let inner = ins.inner.trim();
+        if inner.contains("<body") || inner.contains("</body") || inner.contains("<html") {
+            return Err(format!("新建块 {} 的内容包含非法结构标签", ins.index + 1));
+        }
+        if !inner.is_empty() {
+            validate_xml(&format!(
+                "<wrap xmlns=\"http://www.w3.org/1999/xhtml\">{}</wrap>",
+                inner
+            ))
+            .map_err(|e| format!("新建块内容不合法：{}", e))?;
+        }
+        let snippet = format!(
+            "{}{}<{}>{}</{}>",
+            newline_of(raw),
+            line_indent(raw, info.start),
+            tag,
+            inner,
+            tag
+        );
+        match insert_groups.iter_mut().find(|(index, _)| *index == ins.index) {
+            Some((_, text)) => text.push_str(&snippet),
+            None => insert_groups.push((ins.index, snippet)),
+        }
+        inserted += 1;
+    }
+    for (index, snippet) in insert_groups {
+        let info = &blocks[index];
+        actions.push((info.end, info.end, snippet));
+    }
+
     actions.sort_by(|a, b| b.0.cmp(&a.0));
     let mut last_start = raw.len() + 1;
     for (s, e, _) in &actions {
@@ -2094,7 +2707,7 @@ pub fn apply_block_edits(raw: &str, edits: &[BlockEdit]) -> Result<(String, usiz
         out.replace_range(s..e, &rep);
     }
     validate_xml(&out)?;
-    Ok((out, replaced, deleted))
+    Ok((out, replaced, deleted, inserted))
 }
 
 /// 扫描工作副本里的章节文件，返回块坐标
@@ -2104,16 +2717,28 @@ pub fn scan_blocks(edit_dir: &Path, rel_path: &str) -> Result<Vec<BlockInfo>, St
 }
 
 /// 只替换 dirty 块并写回章节文件
+#[cfg(test)]
 pub fn write_blocks(edit_dir: &Path, rel_path: &str, edits: &[BlockEdit]) -> Result<BlockWriteResult, String> {
+    write_blocks_with_inserts(edit_dir, rel_path, edits, &[])
+}
+
+/// 只替换 dirty 块、按需插入新块，并写回章节文件
+pub fn write_blocks_with_inserts(
+    edit_dir: &Path,
+    rel_path: &str,
+    edits: &[BlockEdit],
+    inserts: &[InsertEdit],
+) -> Result<BlockWriteResult, String> {
     let path = edit_dir.join(rel_path);
     let raw = fs::read_to_string(&path).map_err(|e| format!("读 {} 失败: {}", rel_path, e))?;
     let total = scan_blocks_raw(&raw)?.len();
     let bytes_before = raw.len();
-    let (out, replaced, deleted) = apply_block_edits(&raw, edits)?;
+    let (out, replaced, deleted, inserted) = apply_block_edits_ex(&raw, edits, inserts)?;
     fs::write(&path, out.as_bytes()).map_err(|e| format!("写 {} 失败: {}", rel_path, e))?;
     Ok(BlockWriteResult {
         replaced,
         deleted,
+        inserted,
         total,
         bytes_before,
         bytes_after: out.len(),
@@ -2177,6 +2802,43 @@ mod e6_tests {
         }
         assert!(out.contains("<h2 class=\"p10\" data-x=\"10\">第10段"));
         assert!(!out.contains("第20段"));
+    }
+
+    #[test]
+    fn insert_blocks_after_anchor_keeps_other_bytes() {
+        let raw = sample();
+        let before: Vec<String> = scan_blocks_raw(&raw)
+            .unwrap()
+            .iter()
+            .map(|b| raw[b.start..b.end].to_string())
+            .collect();
+        let inserts = vec![
+            InsertEdit {
+                index: 1,
+                tag: "h2".into(),
+                inner: "新增标题".into(),
+            },
+            InsertEdit {
+                index: 1,
+                tag: "p".into(),
+                inner: String::new(),
+            },
+        ];
+        let (out, replaced, deleted, inserted) =
+            apply_block_edits_ex(&raw, &[], &inserts).unwrap();
+        assert_eq!((replaced, deleted, inserted), (0, 0, 2));
+
+        let after = scan_blocks_raw(&out).unwrap();
+        assert_eq!(after.len(), 32);
+        assert_eq!(after[2].tag, "h2");
+        assert_eq!(after[3].tag, "p");
+        // 原有块一个都没被改动
+        for (i, block) in before.iter().enumerate() {
+            assert!(out.contains(block), "原块 {} 的字节未保留：{}", i, block);
+        }
+        // 新建块与相邻段同缩进
+        assert!(out.contains("\n    <h2>新增标题</h2>"));
+        assert!(out.contains("\n    <p></p>"));
     }
 
     #[test]

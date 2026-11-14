@@ -1,15 +1,12 @@
 /**
  * 锻造层的数据模型与文本工具。
  *
- * - 改写：按段落行范围替换源文件正文行。
- * - 译文/注释：只存覆盖层（forge.json），不进 TXT。
+ * - 译文：S10 起写入独立译文工程（`译文/<语言>/`），母本不改。
+ * - 注释：只存覆盖层（forge.json），不进母本。
  * - diff：行级 Myers diff，供版本差异查看。
  */
 
-import type { TxtAnalysis } from './txt-chapters'
-
 export type ForgeEdit = {
-  rewrite?: string
   translate?: string
   note?: string
 }
@@ -34,7 +31,7 @@ export function editKey(chapter: number, paragraph: number): string {
 }
 
 export function hasEdit(edit: ForgeEdit | undefined): boolean {
-  return Boolean(edit?.rewrite?.trim() || edit?.translate?.trim() || edit?.note?.trim())
+  return Boolean(edit?.translate?.trim() || edit?.note?.trim())
 }
 
 /** 覆盖层 JSON → 编辑表；损坏或版本不符时按空表处理。 */
@@ -48,7 +45,6 @@ export function parseForgeState(raw: string): ForgeEdits {
       if (!value || typeof value !== 'object') continue
       const edit = value as ForgeEdit
       const cleaned: ForgeEdit = {}
-      if (typeof edit.rewrite === 'string' && edit.rewrite.trim()) cleaned.rewrite = edit.rewrite
       if (typeof edit.translate === 'string' && edit.translate.trim()) cleaned.translate = edit.translate
       if (typeof edit.note === 'string' && edit.note.trim()) cleaned.note = edit.note
       if (hasEdit(cleaned)) out[key] = cleaned
@@ -61,61 +57,6 @@ export function parseForgeState(raw: string): ForgeEdits {
 
 export function serializeForgeState(edits: ForgeEdits): string {
   return JSON.stringify({ version: 1, edits } satisfies ForgeState)
-}
-
-/** 单段约束：换行与连续空白合并为一行，避免改写后段落数变化导致键位漂移。 */
-export function normalizeRewrite(text: string): string {
-  return text.replace(/\s*\n\s*/g, ' ').replace(/\s{2,}/g, ' ').trim()
-}
-
-export type ApplyResult = {
-  text: string
-  changed: number
-  skipped: number
-}
-
-/**
- * 把改了写的段落写回整本书的行数组。
- * 只替换每段的起止行，其余行（标题、空行、前言）原样保留。
- */
-export function applyRewrites(
-  analysis: TxtAnalysis,
-  lines: string[],
-  edits: ForgeEdits,
-): ApplyResult {
-  const patches: { start: number; end: number; text: string }[] = []
-  let skipped = 0
-
-  analysis.chapters.forEach((chapter, chapterIndex) => {
-    chapter.paragraphs.forEach((original, paragraphIndex) => {
-      const rewrite = edits[editKey(chapterIndex, paragraphIndex)]?.rewrite
-      if (!rewrite) return
-      const next = normalizeRewrite(rewrite)
-      if (!next || next === original.trim()) return
-      const range = chapter.paragraphRanges?.[paragraphIndex]
-      if (!range || range.start < 0 || range.end < range.start || range.end >= lines.length) {
-        skipped += 1
-        return
-      }
-      patches.push({ start: range.start, end: range.end, text: next })
-    })
-  })
-
-  patches.sort((a, b) => b.start - a.start)
-  const out = [...lines]
-  let nearest = Number.POSITIVE_INFINITY
-  let changed = 0
-  for (const patch of patches) {
-    // 范围重叠时放弃靠后的那条，绝不写出错位的正文
-    if (patch.end >= nearest) {
-      skipped += 1
-      continue
-    }
-    out.splice(patch.start, patch.end - patch.start + 1, patch.text)
-    nearest = patch.start
-    changed += 1
-  }
-  return { text: out.join('\n'), changed, skipped }
 }
 
 export type DiffRow = {
@@ -140,7 +81,7 @@ export type DiffResult = {
 const MAX_EDIT_DISTANCE = 1500
 
 /** 标准 Myers diff；只返回操作序列，超限时返回 null。 */
-function myers(a: string[], b: string[]): ('same' | 'del' | 'add')[] | null {
+export function myers(a: string[], b: string[]): ('same' | 'del' | 'add')[] | null {
   const n = a.length
   const m = b.length
   const max = Math.min(n + m, MAX_EDIT_DISTANCE)

@@ -1,15 +1,33 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { PointerEvent as ReactPointerEvent } from 'react'
+import { useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
 import { open } from '@tauri-apps/plugin-dialog'
 import Icon from './Icon'
+import PageBar from './PageBar'
 import GlossaryDialog from './GlossaryDialog'
 import { FORMATS } from '../lib/formats'
-import { FEATURES, STATUS_LABEL, type SettingMeta } from '../lib/features'
-import { probeEngine, translateConfigFromPrefs } from '../lib/translate'
+import {
+  FEATURES,
+  GROUP_LABEL,
+  SHORTCUTS,
+  SHORTCUT_SCOPE_LABEL,
+  STATUS_LABEL,
+  type FeatureEntry,
+  type SettingMeta,
+  type ShortcutScope,
+} from '../lib/features'
+import { probeEngine, translateConfigFromPrefs, type EngineName } from '../lib/translate'
 import type { Prefs } from '../lib/prefs'
 import type { AppSettings } from '../types'
+
+const ENGINE_LABEL: Record<EngineName, string> = {
+  online: '在线',
+  local: '本机 HTTP',
+  builtin: '内置离线',
+  baidu: '百度翻译',
+  baiduLlm: '百度大模型',
+  memory: '翻译记忆',
+}
 
 /** 与 Rust 端 default_dirs 保持一致，仅作为接口失败时的兜底 */
 const FALLBACK_DIRS = {
@@ -18,18 +36,41 @@ const FALLBACK_DIRS = {
   finalExport: 'D:\\AI Coding Project Management\\Scrollforge\\final export',
 }
 
-/** 可拖动/缩放设置窗口的持久化键（存位置和尺寸） */
-const POS_KEY = 'scrollforge:settings-window-pos'
-const SIZE_KEY = 'scrollforge:settings-window-size'
-const MIN_W = 640
-const MIN_H = 420
-const MAX_W = 1600
-const MAX_H = 1100
+/** 旧版浮动窗口的位置与尺寸持久化键；现在设置是整页，挂载时清掉历史脏数据。 */
+const LEGACY_POS_KEY = 'scrollforge:settings-window-pos'
+const LEGACY_SIZE_KEY = 'scrollforge:settings-window-size'
 
 const ALL_FORMATS: { ext: string; label: string }[] = FORMATS.map((item) => ({
   ext: item.ext,
   label: item.label,
 }))
+
+/** library_check 的返回结构（与 Rust 端 LibraryReport 保持一致） */
+type LibraryReport = {
+  scanned: number
+  books: number
+  renamed: number
+  indexRebuilt: boolean
+  missingDirs: string[]
+  unregistered: string[]
+  duplicates: string[]
+  changedSources: string[]
+  legacyDirs: string[]
+  sidecarsMoved: number
+  legacySidecars: string[]
+  unknownSidecars: string[]
+}
+
+export type SettingsSection =
+  | 'storage'
+  | 'import'
+  | 'reading'
+  | 'editing'
+  | 'forge'
+  | 'translate'
+  | 'general'
+  | 'shortcuts'
+  | 'about'
 
 type Props = {
   settings: AppSettings
@@ -37,10 +78,15 @@ type Props = {
   onClose: () => void
   onSave: (settings: AppSettings, prefs: Prefs) => Promise<void>
   onNotify: (message: string) => void
-  onHelp: () => void
+  /** 打开时定位到的分类（左下角菜单「关于」用） */
+  initialSection?: SettingsSection
 }
 
-type Section = 'storage' | 'import' | 'features' | 'about'
+type Section = SettingsSection
+
+/** 功能分区的键，设置页与帮助页共用同一顺序 */
+const GROUP_KEYS = ['reading', 'editing', 'forge', 'translate', 'general'] as const
+const SCOPE_ORDER: ShortcutScope[] = ['universal', 'shelf', 'reading', 'editing', 'forge']
 
 type DirKey = 'libraryDir' | 'readingHistoryDir' | 'finalExportDir'
 
@@ -95,22 +141,64 @@ type SettingRowProps = {
   setting: SettingMeta
   prefs: Prefs
   onChange: (patch: Partial<Prefs>) => void
-  onAction: (action: 'storage' | 'glossary' | 'translateTest') => void
+  onAction: (action: 'storage' | 'glossary' | 'translateTest' | 'translateModel') => void
+  /** 内置离线模型的状态与下载进度（只有翻译设置项用得到） */
+  model?: { installed: boolean; bytes: number; approxBytes: number; dir: string } | null
+  download?: { done: number; total: number } | null
 }
 
-const ACTION_LABEL: Record<'storage' | 'glossary' | 'translateTest', { icon: string; text: string }> = {
+function formatSize(bytes: number): string {
+  if (!bytes) return '0 MB'
+  // 用十进制换算，和文案里的「约 900MB」保持同一口径
+  const mb = bytes / 1_000_000
+  return mb >= 1000 ? `${(mb / 1000).toFixed(2)} GB` : `${Math.round(mb)} MB`
+}
+
+const ACTION_LABEL: Record<
+  'storage' | 'glossary' | 'translateTest' | 'translateModel',
+  { icon: string; text: string }
+> = {
   storage: { icon: 'folder_open', text: '去设置文件夹' },
   glossary: { icon: 'translate', text: '打开术语表' },
   translateTest: { icon: 'network_check', text: '测试连接' },
+  translateModel: { icon: 'download', text: '下载离线模型' },
 }
 
 /** 功能注册表里的一个设置项：开关 / 下拉 / 数字 / 文本 / 说明 */
-function SettingRow({ setting, prefs, onChange, onAction }: SettingRowProps) {
+function SettingRow({ setting, prefs, onChange, onAction, model, download }: SettingRowProps) {
   if (setting.kind === 'note') {
+    const pct =
+      download && download.total > 0
+        ? Math.min(100, Math.round((download.done / download.total) * 100))
+        : download
+          ? 0
+          : null
     return (
       <div className="feature-setting feature-setting__note">
         <span className="feature-setting__label">{setting.label}</span>
         <small>{setting.hint}</small>
+        {setting.action === 'translateModel' && model && (
+          <div className="feature-model">
+            <span className={`feature-model__state ${model.installed ? 'ok' : ''}`}>
+              {model.installed
+                ? `已安装 · ${formatSize(model.bytes)}`
+                : model.bytes > 0
+                  ? `下载中断 · ${formatSize(model.bytes)} / 约 ${formatSize(model.approxBytes)}`
+                  : `未安装 · 约 ${formatSize(model.approxBytes)}`}
+            </span>
+            <span className="feature-model__dir" title={model.dir}>
+              存放：{model.dir}
+            </span>
+            {pct !== null && (
+              <div className="feature-progress" role="progressbar" aria-valuenow={pct}>
+                <i style={{ width: `${pct}%` }} />
+                <span>
+                  {pct}% · {formatSize(download?.done ?? 0)} / 约 {formatSize(download?.total ?? 0)}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
         {setting.action && (
           <button className="btn feature-setting__action" onClick={() => onAction(setting.action!)}>
             <Icon name={ACTION_LABEL[setting.action].icon} size={15} />
@@ -215,8 +303,110 @@ function SettingRow({ setting, prefs, onChange, onAction }: SettingRowProps) {
   )
 }
 
-export default function SettingsDialog({ settings, prefs, onClose, onSave, onNotify, onHelp }: Props) {
-  const [section, setSection] = useState<Section>('storage')
+type FeatureSectionProps = {
+  group: FeatureEntry['group']
+  prefs: Prefs
+  query: string
+  onChange: (patch: Partial<Prefs>) => void
+  onAction: (action: 'storage' | 'glossary' | 'translateTest' | 'translateModel') => void
+  model?: { installed: boolean; bytes: number; approxBytes: number; dir: string } | null
+  download?: { done: number; total: number } | null
+}
+
+function featureMatches(feature: FeatureEntry, query: string): boolean {
+  if (!query) return true
+  const needle = query.toLowerCase()
+  return (
+    feature.title.toLowerCase().includes(needle) ||
+    feature.desc.toLowerCase().includes(needle) ||
+    feature.where.toLowerCase().includes(needle) ||
+    feature.settings.some(
+      (setting) => setting.label.toLowerCase().includes(needle) || setting.hint.toLowerCase().includes(needle),
+    )
+  )
+}
+
+/** 一个功能分区：功能卡片可展开/收起，支持搜索过滤（设置页与帮助页共用口径） */
+function FeatureSection({ group, prefs, query, onChange, onAction, model, download }: FeatureSectionProps) {
+  const items = FEATURES.filter((feature) => feature.group === group && featureMatches(feature, query))
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+
+  return (
+    <>
+      <h2>{GROUP_LABEL[group]}功能</h2>
+      <p className="settings-hint">
+        每个功能都来自同一份功能注册表，帮助说明书（F1）由它生成；点击标题可展开或收起细节。
+      </p>
+      {items.length === 0 && <p className="settings-hint">没有匹配「{query}」的功能。</p>}
+      <div className="feature-list">
+        {items.map((feature) => {
+          const open = !collapsed[feature.id]
+          return (
+            <div
+              key={feature.id}
+              className={`feature-card ${feature.status === 'planned' ? 'feature-card--planned' : ''} ${open ? 'is-open' : ''}`}
+            >
+              <button
+                className="feature-card__head"
+                aria-expanded={open}
+                onClick={() => setCollapsed((prev) => ({ ...prev, [feature.id]: !prev[feature.id] }))}
+              >
+                <span className="feature-icon"><Icon name={feature.icon} size={20} /></span>
+                <span className="feature-title">
+                  {feature.title}
+                  <em
+                    className={`feature-tag ${
+                      feature.status === 'online' ? 'on' : feature.status === 'beta' ? 'beta' : ''
+                    }`}
+                  >
+                    {STATUS_LABEL[feature.status]}
+                  </em>
+                </span>
+                <Icon name={open ? 'expand_less' : 'expand_more'} size={18} />
+              </button>
+              {open && (
+                <div className="feature-text">
+                  <span className="feature-desc">{feature.desc}</span>
+                  <span className="feature-where">{feature.where}</span>
+                  {feature.settings.length > 0 && (
+                    <div className="feature-settings">
+                      {feature.settings.map((setting) => (
+                        <SettingRow
+                          key={setting.label}
+                          setting={setting}
+                          prefs={prefs}
+                          onChange={onChange}
+                          onAction={onAction}
+                          model={
+                            'action' in setting && setting.action === 'translateModel' ? model : undefined
+                          }
+                          download={
+                            'action' in setting && setting.action === 'translateModel' ? download : undefined
+                          }
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </>
+  )
+}
+
+export default function SettingsDialog({
+  settings,
+  prefs,
+  onClose,
+  onSave,
+  onNotify,
+  initialSection = 'storage',
+}: Props) {
+  const [section, setSection] = useState<Section>(initialSection)
+  const [query, setQuery] = useState('')
   const [draft, setDraft] = useState<AppSettings>({ ...settings })
   const [draftPrefs, setDraftPrefs] = useState<Prefs>({ ...prefs })
   const [saving, setSaving] = useState(false)
@@ -225,33 +415,32 @@ export default function SettingsDialog({ settings, prefs, onClose, onSave, onNot
   const [version, setVersion] = useState('')
   const [glossaryOpen, setGlossaryOpen] = useState(false)
   const [testing, setTesting] = useState(false)
+  const [model, setModel] = useState<{
+    installed: boolean
+    bytes: number
+    approxBytes: number
+    dir: string
+  } | null>(null)
+  const [download, setDownload] = useState<{ done: number; total: number } | null>(null)
+  const [checkingLibrary, setCheckingLibrary] = useState(false)
+  const [libraryReport, setLibraryReport] = useState<LibraryReport | null>(null)
 
-  // ── 设置窗口拖动 / 缩放状态 ──
-  const [pos, setPos] = useState<{ x: number; y: number }>(() => {
+  // 清掉旧版浮动窗口留下的坐标/尺寸，避免历史脏数据继续影响任何组件
+  useEffect(() => {
     try {
-      const raw = localStorage.getItem(POS_KEY)
-      if (raw) return JSON.parse(raw)
-    } catch { /* ignore */ }
-    return { x: Math.max(24, (window.innerWidth - 840) / 2), y: Math.max(24, (window.innerHeight - 660) / 2) }
-  })
-  const [size, setSize] = useState<{ w: number; h: number }>(() => {
-    try {
-      const raw = localStorage.getItem(SIZE_KEY)
-      if (raw) {
-        const { w, h } = JSON.parse(raw)
-        if (Number.isFinite(w) && Number.isFinite(h)) return { w: Math.min(MAX_W, Math.max(MIN_W, w)), h: Math.min(MAX_H, Math.max(MIN_H, h)) }
-      }
-    } catch { /* ignore */ }
-    return { w: 840, h: 660 }
-  })
-  const posRef = useRef(pos)
-  const sizeRef = useRef(size)
-  const dragOffsetRef = useRef<{ dx: number; dy: number } | null>(null)
-  const resizeStartRef = useRef<{ w: number; h: number; px: number; py: number } | null>(null)
-  posRef.current = pos
-  sizeRef.current = size
+      localStorage.removeItem(LEGACY_POS_KEY)
+      localStorage.removeItem(LEGACY_SIZE_KEY)
+    } catch {
+      // 隐私模式等场景忽略
+    }
+  }, [])
 
-  // Esc 关闭（保持和说明书一致：Esc 关闭弹层）
+  // 切换分类时清空搜索，避免上一页关键词把下一页过滤空
+  useEffect(() => {
+    setQuery('')
+  }, [section])
+
+  // Esc 关闭（整页与说明书一致：Esc 关闭）
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -262,53 +451,6 @@ export default function SettingsDialog({ settings, prefs, onClose, onSave, onNot
     return () => document.removeEventListener('keydown', handler)
   }, [onClose, saving])
 
-  // 拖动 / 缩放的全局 pointermove / pointerup 监听（挂 window，确保拖出元素仍能收到）
-  useEffect(() => {
-    const onMove = (e: PointerEvent) => {
-      if (dragOffsetRef.current) {
-        const newX = posRef.current.x + (e.clientX - dragOffsetRef.current.dx)
-        const newY = posRef.current.y + (e.clientY - dragOffsetRef.current.dy)
-        const clampedX = Math.max(-posRef.current.x + 40, Math.min(window.innerWidth - 60, newX))
-        const clampedY = Math.max(-posRef.current.y + 40, Math.min(window.innerHeight - 60, newY))
-        setPos({ x: clampedX, y: clampedY })
-        return
-      }
-      if (resizeStartRef.current) {
-        const s = resizeStartRef.current
-        const nw = Math.min(MAX_W, Math.max(MIN_W, s.w + (e.clientX - s.px)))
-        const nh = Math.min(MAX_H, Math.max(MIN_H, s.h + (e.clientY - s.py)))
-        if (nw !== s.w || nh !== s.h) setSize({ w: nw, h: nh })
-      }
-    }
-    const onUp = () => {
-      if (dragOffsetRef.current) {
-        dragOffsetRef.current = null
-        try { localStorage.setItem(POS_KEY, JSON.stringify(posRef.current)) } catch { /* ignore */ }
-      }
-      if (resizeStartRef.current) {
-        resizeStartRef.current = null
-        try { localStorage.setItem(SIZE_KEY, JSON.stringify(sizeRef.current)) } catch { /* ignore */ }
-      }
-    }
-    window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-    return () => {
-      window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-    }
-  }, [])
-
-  const startDrag = useCallback((e: ReactPointerEvent) => {
-    dragOffsetRef.current = { dx: e.clientX - posRef.current.x, dy: e.clientY - posRef.current.y }
-    e.currentTarget.setPointerCapture?.(e.pointerId)
-  }, [])
-
-  const startResize = useCallback((e: ReactPointerEvent) => {
-    e.stopPropagation()
-    e.preventDefault()
-    resizeStartRef.current = { w: sizeRef.current.w, h: sizeRef.current.h, px: e.clientX, py: e.clientY }
-    e.currentTarget.setPointerCapture?.(e.pointerId)
-  }, [])
 
   useEffect(() => {
     void getVersion()
@@ -378,7 +520,7 @@ export default function SettingsDialog({ settings, prefs, onClose, onSave, onNot
     setTesting(true)
     try {
       const result = await probeEngine(translateConfigFromPrefs(draftPrefs))
-      onNotify(`翻译引擎连接正常（${result.engine === 'online' ? '在线' : '本地'} · ${result.ms} ms）`)
+      onNotify(`翻译引擎连接正常（${ENGINE_LABEL[result.engine]} · ${result.ms} ms）`)
     } catch (err) {
       onNotify(`翻译引擎连接失败：${String(err)}`)
     } finally {
@@ -386,48 +528,112 @@ export default function SettingsDialog({ settings, prefs, onClose, onSave, onNot
     }
   }
 
-  const handleAction = (action: 'storage' | 'glossary' | 'translateTest') => {
+  const modelDir = draftPrefs.translateModelDir
+
+  useEffect(() => {
+    let alive = true
+    void invoke<Array<{ installed: boolean; bytes: number; approxBytes: number; dir: string }>>(
+      'nmt_status',
+      { dir: modelDir || null },
+    )
+      .then((list) => {
+        if (alive) setModel(list[0] ?? null)
+      })
+      .catch((err) => console.warn('读取离线模型状态失败：', err))
+    return () => {
+      alive = false
+    }
+  }, [modelDir])
+
+  /** 下载内置离线模型：用轮询 nmt_status 驱动进度条（比事件更可靠）。 */
+  const downloadModel = async () => {
+    if (download) return
+    setDownload({ done: 0, total: 0 })
+    onNotify('开始下载内置离线模型（约 900MB），请保持网络连通…')
+    let lastPct = -25
+    const timer = window.setInterval(() => {
+      void invoke<Array<{ installed: boolean; bytes: number; approxBytes: number; dir: string }>>(
+        'nmt_status',
+        { dir: modelDir || null },
+      )
+        .then((list) => {
+          const current = list[0]
+          if (!current) return
+          setModel(current)
+          setDownload({ done: current.bytes, total: current.approxBytes })
+          if (current.approxBytes > 0) {
+            const pct = Math.min(100, Math.round((current.bytes / current.approxBytes) * 100))
+            if (pct - lastPct >= 25) {
+              lastPct = pct
+              onNotify(`离线模型下载中：${pct}%`)
+            }
+          }
+        })
+        .catch(() => undefined)
+    }, 1500)
+    try {
+      const status = await invoke<{
+        installed: boolean
+        bytes: number
+        approxBytes: number
+        dir: string
+      }>('nmt_download', { id: 'nllb_600m', dir: modelDir || null })
+      setModel(status)
+      onNotify(
+        status.installed
+          ? `离线模型已就绪（${formatSize(status.bytes)}），之后可断网翻译。`
+          : '离线模型下载未完成，可重试。',
+      )
+    } catch (err) {
+      onNotify(`离线模型下载失败：${String(err)}`)
+    } finally {
+      window.clearInterval(timer)
+      setDownload(null)
+      void invoke<Array<{ installed: boolean; bytes: number; approxBytes: number; dir: string }>>(
+        'nmt_status',
+        { dir: modelDir || null },
+      )
+        .then((list) => setModel(list[0] ?? null))
+        .catch(() => undefined)
+    }
+  }
+
+  const checkLibrary = async () => {
+    if (checkingLibrary) return
+    setCheckingLibrary(true)
+    try {
+      const report = await invoke<LibraryReport>('library_check')
+      setLibraryReport(report)
+      const issues =
+        report.missingDirs.length +
+        report.duplicates.length +
+        report.changedSources.length +
+        report.unregistered.length +
+        report.legacyDirs.length +
+        report.legacySidecars.length +
+        report.unknownSidecars.length
+      onNotify(issues ? `书库检查完成：发现 ${issues} 处需要留意` : '书库检查完成：索引与目录一致')
+    } catch (err) {
+      onNotify(`书库检查失败：${String(err)}`)
+    } finally {
+      setCheckingLibrary(false)
+    }
+  }
+
+  const handleAction = (action: 'storage' | 'glossary' | 'translateTest' | 'translateModel') => {
     if (action === 'storage') setSection('storage')
     else if (action === 'glossary') setGlossaryOpen(true)
+    else if (action === 'translateModel') void downloadModel()
     else void testTranslate()
   }
 
   return (
     <>
-    <div className="modal-mask" role="dialog" aria-label="设置">
-      <div
-        className="settings-float"
-        style={{
-          transform: `translate(${pos.x}px, ${pos.y}px)`,
-          width: size.w,
-          height: size.h,
-        }}
-      >
-        <div
-          className="modal-titlebar"
-          onPointerDown={startDrag}
-        >
-          <div className="modal-titlebar__brand">
-            <Icon name="settings" size={16} />
-            <span>设置</span>
-          </div>
-          <button
-            className="modal-titlebar__close"
-            aria-label="关闭设置（Esc）"
-            onClick={onClose}
-            disabled={saving}
-            title="关闭设置（Esc）"
-          >
-            <Icon name="close" size={16} />
-          </button>
-        </div>
+    <div className="settings-page" role="dialog" aria-label="设置">
+      <PageBar title="设置" icon="settings" onBack={onClose} />
 
       <div className="settings-modal">
         <aside className="settings-nav">
-          <div className="settings-brand">
-            <Icon name="settings" size={20} />
-            <span>设置</span>
-          </div>
           <button className={section === 'storage' ? 'on' : ''} onClick={() => setSection('storage')}>
             <Icon name="inventory_2" size={17} />
             <span>文件夹与书库</span>
@@ -436,21 +642,56 @@ export default function SettingsDialog({ settings, prefs, onClose, onSave, onNot
             <Icon name="file_open" size={17} />
             <span>导入</span>
           </button>
-          <button className={section === 'features' ? 'on' : ''} onClick={() => setSection('features')}>
-            <Icon name="widgets" size={17} />
-            <span>功能</span>
+          <div className="settings-nav__group">功能</div>
+          {(['reading', 'editing', 'forge', 'translate', 'general'] as const).map((group) => (
+            <button
+              key={group}
+              className={section === group ? 'on' : ''}
+              onClick={() => setSection(group)}
+            >
+              <Icon
+                name={
+                  group === 'reading'
+                    ? 'auto_stories'
+                    : group === 'editing'
+                      ? 'edit_note'
+                      : group === 'forge'
+                        ? 'build'
+                        : group === 'translate'
+                          ? 'translate'
+                          : 'widgets'
+                }
+                size={17}
+              />
+              <span>{GROUP_LABEL[group]}</span>
+            </button>
+          ))}
+          <div className="settings-nav__group">其他</div>
+          <button className={section === 'shortcuts' ? 'on' : ''} onClick={() => setSection('shortcuts')}>
+            <Icon name="keyboard" size={17} />
+            <span>快捷键</span>
           </button>
           <button className={section === 'about' ? 'on' : ''} onClick={() => setSection('about')}>
             <Icon name="info" size={17} />
             <span>关于</span>
           </button>
-          <button className="settings-nav__help" onClick={onHelp}>
-            <Icon name="menu_book" size={17} />
-            <span>说明书（F1）</span>
-          </button>
         </aside>
 
         <section className="settings-main">
+          {GROUP_KEYS.includes(section as (typeof GROUP_KEYS)[number]) && (
+            <div className="settings-search">
+              <Icon name="search" size={16} />
+              <input
+                type="search"
+                value={query}
+                placeholder="搜索功能、设置项或说明"
+                onChange={(event) => setQuery(event.target.value)}
+              />
+              {query && (
+                <button className="btn small" onClick={() => setQuery('')}>清空</button>
+              )}
+            </div>
+          )}
           {section === 'storage' && (
             <>
               <h2>书籍与文件夹</h2>
@@ -494,6 +735,80 @@ export default function SettingsDialog({ settings, prefs, onClose, onSave, onNot
                   onReset={() => patch({ finalExportDir: defaults.finalExport })}
                 />
               </div>
+
+              <div className="library-check">
+                <div className="library-check__head">
+                  <span className="library-check__icon"><Icon name="fact_check" size={18} /></span>
+                  <div className="library-check__text">
+                    <span className="library-check__title">书库索引自检</span>
+                    <small>
+                      书籍目录已按「书名__短编号」命名；索引缺失或损坏会自动重建，不阻塞阅读。
+                      检查会核对正文是否缺失、目录是否未登记、编号是否重复。
+                    </small>
+                  </div>
+                  <button className="btn" disabled={checkingLibrary} onClick={() => void checkLibrary()}>
+                    <Icon name={checkingLibrary ? 'hourglass_top' : 'fact_check'} size={16} />
+                    {checkingLibrary ? '检查中…' : '检查书库'}
+                  </button>
+                </div>
+                {libraryReport && (
+                  <div className="library-check__body">
+                    <div className="library-check__stats">
+                      <span>目录 {libraryReport.scanned}</span>
+                      <span>索引 {libraryReport.books}</span>
+                      {libraryReport.renamed > 0 && <span>本次整理 {libraryReport.renamed}</span>}
+                      {libraryReport.sidecarsMoved > 0 && (
+                        <span>迁入阅读壳 {libraryReport.sidecarsMoved}</span>
+                      )}
+                    </div>
+                    {(
+                      [
+                        ['正文缺失', libraryReport.missingDirs],
+                        ['目录未登记', libraryReport.unregistered],
+                        ['编号重复', libraryReport.duplicates],
+                        ['正文已变动', libraryReport.changedSources],
+                        ['旧式目录', libraryReport.legacyDirs],
+                        ['旧壳文件未迁入', libraryReport.legacySidecars],
+                        ['未识别的壳文件', libraryReport.unknownSidecars],
+                      ] as const
+                    ).map(([label, items]) =>
+                      items.length > 0 && (
+                        <div className="library-check__row" key={label}>
+                          <span>{label}</span>
+                          <em>
+                            {items.slice(0, 6).join('、')}
+                            {items.length > 6 ? ` 等 ${items.length} 本` : ''}
+                          </em>
+                        </div>
+                      ),
+                    )}
+                    {libraryReport.missingDirs.length === 0 &&
+                      libraryReport.unregistered.length === 0 &&
+                      libraryReport.duplicates.length === 0 &&
+                      libraryReport.changedSources.length === 0 &&
+                      libraryReport.legacyDirs.length === 0 &&
+                      libraryReport.legacySidecars.length === 0 &&
+                      libraryReport.unknownSidecars.length === 0 && (
+                        <div className="library-check__ok">
+                          <Icon name="check_circle" size={15} />索引与目录一致
+                        </div>
+                      )}
+                  </div>
+                )}
+              </div>
+
+              <h3>阅读数据存在哪</h3>
+              <p className="settings-hint">
+                高亮、笔记、划词译文都写在书目录内的 <strong>阅读壳/</strong>，与母本同层；
+                文件名固定，不随书名变化。复制或搬走整个书目录，阅读数据就跟着书一起走。
+                <br />
+                <code>&lt;书名&gt;__&lt;短编号&gt;/</code>：<code>source.epub</code>（母本）+
+                <code>阅读壳/manifest.json</code>（母本指纹）、
+                <code>阅读壳/annotations.json</code>（高亮与笔记）、
+                <code>阅读壳/translate-drafts.json</code>（划词译文）。
+                <br />
+                清浏览器缓存不会丢标注；锻造译文仍在书目录根的 <code>forge-draft.json</code>，导出只读不写回。
+              </p>
 
               <label className="settings-switch">
                 <input
@@ -561,49 +876,46 @@ export default function SettingsDialog({ settings, prefs, onClose, onSave, onNot
             </>
           )}
 
-          {section === 'features' && (
-            <>
-              <h2>功能与设置</h2>
-              <p className="settings-hint">
-                下面每一项都来自同一份功能注册表，F1 说明书也由它生成。
-                「已上线」功能至少有一个可调项；「实验中」可以随时关闭；「规划中」只做入口占位。
-              </p>
+          {(['reading', 'editing', 'forge', 'translate', 'general'] as const).map((group) =>
+            section === group ? (
+              <FeatureSection
+                key={group}
+                group={group}
+                prefs={draftPrefs}
+                query={query}
+                onChange={patchPrefs}
+                onAction={handleAction}
+                model={group === 'translate' ? model : undefined}
+                download={group === 'translate' ? download : undefined}
+              />
+            ) : null,
+          )}
 
-              <div className="feature-list">
-                {FEATURES.map((feature) => (
-                  <div
-                    key={feature.id}
-                    className={`feature-card ${feature.status === 'planned' ? 'feature-card--planned' : ''}`}
-                  >
-                    <span className="feature-icon"><Icon name={feature.icon} size={20} /></span>
-                    <div className="feature-text">
-                      <span className="feature-title">
-                        {feature.title}
-                        <em
-                          className={`feature-tag ${
-                            feature.status === 'online' ? 'on' : feature.status === 'beta' ? 'beta' : ''
-                          }`}
-                        >
-                          {STATUS_LABEL[feature.status]}
-                        </em>
-                      </span>
-                      <span className="feature-desc">{feature.desc}</span>
-                      <span className="feature-where">{feature.where}</span>
-                      <div className="feature-settings">
-                        {feature.settings.map((setting) => (
-                          <SettingRow
-                            key={setting.label}
-                            setting={setting}
-                            prefs={draftPrefs}
-                            onChange={patchPrefs}
-                            onAction={handleAction}
-                          />
+          {section === 'shortcuts' && (
+            <>
+              <h2>快捷键</h2>
+              <p className="settings-hint">
+                与说明书（F1）同源，按使用场景分组；通用键在任何页面都成立。Ctrl + Z 是通用撤销，只在编辑段落与译文框里生效。
+              </p>
+              {SCOPE_ORDER.map((scope) => {
+                const rows = SHORTCUTS.filter((item) => item.scope === scope)
+                if (!rows.length) return null
+                return (
+                  <div className="settings-shortcut-group" key={scope}>
+                    <h3>{SHORTCUT_SCOPE_LABEL[scope]}</h3>
+                    <table className="shortcut-table">
+                      <tbody>
+                        {rows.map((item) => (
+                          <tr key={`${scope}-${item.keys}-${item.label}`}>
+                            <td><kbd>{item.keys}</kbd></td>
+                            <td>{item.label}</td>
+                          </tr>
                         ))}
-                      </div>
-                    </div>
+                      </tbody>
+                    </table>
                   </div>
-                ))}
-              </div>
+                )
+              })}
             </>
           )}
 
@@ -629,9 +941,9 @@ export default function SettingsDialog({ settings, prefs, onClose, onSave, onNot
                 <dt>本地书库</dt><dd>{draft.libraryDir}</dd>
                 <dt>最终成品</dt><dd>{draft.finalExportDir}</dd>
               </dl>
-              <button className="btn about-help" onClick={onHelp}>
-                <Icon name="menu_book" size={16} />打开说明书（F1）
-              </button>
+              <p className="settings-hint">
+                快捷键与全部功能的详细说明已独立成「帮助说明书」，可从书架左下角菜单或按 F1 打开。
+              </p>
             </>
           )}
 
@@ -651,17 +963,6 @@ export default function SettingsDialog({ settings, prefs, onClose, onSave, onNot
             </button>
           </div>
         </section>
-      </div>
-        <div
-          className="resize-handle"
-          aria-label="拖动右下角调整大小"
-          title="拖动右下角调整大小"
-          onPointerDown={startResize}
-        >
-          <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
-            <path d="M1 11 L11 1 M5 11 L11 5 M9 11 L11 9" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round"/>
-          </svg>
-        </div>
       </div>
     </div>
       {glossaryOpen && (

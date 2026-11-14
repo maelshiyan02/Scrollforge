@@ -7,7 +7,7 @@ import Reader from './components/Reader'
 import ConvertWizard from './components/ConvertWizard'
 import ExportTextDialog from './components/ExportTextDialog'
 import NewBookWizard from './components/NewBookWizard'
-import SettingsDialog from './components/SettingsDialog'
+import SettingsDialog, { type SettingsSection } from './components/SettingsDialog'
 import HelpDialog from './components/HelpDialog'
 import ImportDialog, { type ImportRequest } from './components/ImportDialog'
 import CheckDialog from './components/CheckDialog'
@@ -55,6 +55,7 @@ export default function App() {
   const [newBookOpen, setNewBookOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>('storage')
   const [helpOpen, setHelpOpen] = useState(false)
   const [checkBook, setCheckBook] = useState<BookMeta | null>(null)
   const [exportBook, setExportBook] = useState<BookMeta | null>(null)
@@ -72,17 +73,29 @@ export default function App() {
     if (toastTimer.current) window.clearTimeout(toastTimer.current)
   }, [])
 
-  // F1 内置说明书：窗口级监听；阅读器 iframe 内另由 Reader 转发
+  // F1 内置说明书 / Ctrl+, 设置：窗口级监听；阅读器 iframe 内另由 Reader 转发
+  // Esc 用捕获阶段：先关最上层整页（说明书 / 设置），避免阅读页同时收到 Esc 直接退出书
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && (helpOpen || settingsOpen)) {
+        event.preventDefault()
+        event.stopPropagation()
+        if (helpOpen) setHelpOpen(false)
+        else setSettingsOpen(false)
+        return
+      }
       if (event.key === 'F1') {
         event.preventDefault()
         setHelpOpen((value) => !value)
+      } else if ((event.ctrlKey || event.metaKey) && event.key === ',') {
+        event.preventDefault()
+        setSettingsSection('storage')
+        setSettingsOpen(true)
       }
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [])
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [helpOpen, settingsOpen])
 
   // 启动与「刷新书架」共用：先自检（修复封面、清理冗余、检查正文），再列书架
   const refreshLibrary = useCallback(async () => {
@@ -349,7 +362,15 @@ export default function App() {
           onNewBook={() => setNewBookOpen(true)}
           onOpenFile={chooseOpenFile}
           onRefresh={() => void refreshLibrary()}
-          onSettings={() => setSettingsOpen(true)}
+          onSettings={() => {
+            setSettingsSection('storage')
+            setSettingsOpen(true)
+          }}
+          onHelp={() => setHelpOpen(true)}
+          onAbout={() => {
+            setSettingsSection('about')
+            setSettingsOpen(true)
+          }}
           onConvert={(book) => setWizard({ initial: book })}
           onCheck={setCheckBook}
           onEditEpub={(book) => {
@@ -372,7 +393,6 @@ export default function App() {
           onBack={() => { setRoute('shelf'); void refreshLibrary() }}
           onOpenEpub={chooseOpenFile}
           onNotify={notify}
-          libraryDir={settings?.libraryDir}
           exportDir={settings?.finalExportDir}
           autoEditBookId={editBookId}
           onAutoEditConsumed={() => setEditBookId(null)}
@@ -399,24 +419,15 @@ export default function App() {
         <SettingsDialog
           settings={settings}
           prefs={prefs}
+          initialSection={settingsSection}
           onClose={() => setSettingsOpen(false)}
           onSave={saveAppSettings}
           onNotify={notify}
-          onHelp={() => {
-            setSettingsOpen(false)
-            setHelpOpen(true)
-          }}
         />
       )}
 
       {helpOpen && (
-        <HelpDialog
-          onClose={() => setHelpOpen(false)}
-          onOpenSettings={() => {
-            setHelpOpen(false)
-            setSettingsOpen(true)
-          }}
-        />
+        <HelpDialog onClose={() => setHelpOpen(false)} />
       )}
 
       {checkBook && <CheckDialog book={checkBook} onClose={() => setCheckBook(null)} />}
